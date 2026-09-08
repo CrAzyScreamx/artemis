@@ -1,0 +1,26 @@
+# ARTEMIS as a headless MCP server for a remote brain (e.g. NanoClaw).
+# Phone reaches the container over wireless ADB; the brain reaches it over SSE.
+# No LLM key needed: the 'adb' server exposes raw actions (tap/swipe/type/key/
+# launch_app/screenshot/hierarchy) and the calling agent does the thinking.
+#
+#   PHONE_ADB=192.168.1.50:5555 docker compose -f docker-compose.mcp.yml up -d
+#   One-time pairing (Android 11+ wireless debugging):
+#   docker compose -f docker-compose.mcp.yml exec artemis-mcp adb pair <ip:pair-port> <code>
+services:
+  artemis-mcp:
+    build:
+      context: ../..
+      dockerfile: playground/artemis_container/Dockerfile
+    container_name: artemis-mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - ADB_DEVICE_SERIAL=${PHONE_ADB}   # phone ip:port from Wireless debugging
+      - PYTHONUNBUFFERED=1
+    command: ["artemis", "mcp", "--type", "adb", "--transport", "sse", "--host", "0.0.0.0", "--port", "8001"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-m", "2", "-o", "/dev/null", "http://localhost:8001/sse"]
+      interval: 15s
+      timeout: 3s
+      retries: 3

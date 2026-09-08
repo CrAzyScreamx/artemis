@@ -1014,6 +1014,18 @@ def get_anthropic_llm(
     return ModelFactory.create_model(ep)
 
 
+def get_llm_for_model(model_name: str, temperature: float | None = None) -> BaseChatModel:
+    """Picks the provider from the model name for bare model-name config knobs
+    (step_summarizer.model, memory.chunking.model) so non-Gemini setups work."""
+    # ponytail: prefix sniffing; add a `provider` key to those knobs if this ever misroutes.
+    n = model_name.lower()
+    if n.startswith("claude"):
+        return get_anthropic_llm(model_name=model_name, temperature=temperature)
+    if n.startswith(("gpt", "o1", "o3", "o4")):
+        return get_openai_llm(model_name=model_name, temperature=temperature)
+    return get_google_llm(model_name=model_name, temperature=temperature)
+
+
 def get_cached_raw_model(
     provider: str,
     model_name: str,
