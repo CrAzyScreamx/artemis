@@ -1,0 +1,28 @@
+# ARTEMIS headless MCP server for a remote brain (e.g. NanoClaw). Portainer-ready:
+# pulls the image built by .github/workflows/docker.yml, no local build.
+# Phone attaches over wireless ADB; the brain connects to http://<host>:8001/sse.
+# No LLM key needed: the 'adb' server exposes raw actions (tap/swipe/type/key/
+# launch_app/screenshot/hierarchy) and the calling agent does the thinking.
+#
+# Stack env vars (Portainer > Environment variables):
+#   PHONE_IP    phone's Wi-Fi IP (required)
+#   PHONE_PORT  Wireless debugging port (default 5555; pin it once over USB with `adb tcpip 5555`)
+#
+# One-time pairing on Android 11+ (Portainer > container > Console):
+#   adb pair <PHONE_IP>:<pairing-port> <code>
+services:
+  artemis-mcp:
+    image: ghcr.io/crazyscreamx/artemis:latest
+    container_name: artemis-mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - ADB_DEVICE_SERIAL=${PHONE_IP}:${PHONE_PORT:-5555}
+      - PYTHONUNBUFFERED=1
+    command: ["artemis", "mcp", "--type", "adb", "--transport", "sse", "--host", "0.0.0.0", "--port", "8001"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-m", "2", "-o", "/dev/null", "http://localhost:8001/sse"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
