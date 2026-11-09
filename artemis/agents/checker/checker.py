@@ -44,6 +44,7 @@ from langchain_core.tools import BaseTool, tool
 
 from pydantic import BaseModel, Field, ValidationError
 
+from artemis.core.tool_failure import ToolFailure, is_tool_failure
 from artemis.constants import CHECKER_MAX_ITERATIONS
 from artemis.context import ArtemisContext
 from artemis.data_engine.context_vars import CURRENT_TRACE_ID
@@ -56,7 +57,7 @@ from artemis.tools.tool_wrapper import (
     split_multimodal_result,
     tool_result_messages,
 )
-from artemis.utils.logger import get_logger
+from artemis.utils.task_tree import format_actions_clean
 from artemis.utils.ocr_api import is_ocr_configured, perform_ocr
 from artemis.utils.ocr_xml_fusion import (
     _crop_image_remove_status_bar,
@@ -65,6 +66,7 @@ from artemis.utils.ocr_xml_fusion import (
     fuse_ocr_with_xml,
 )
 from artemis.utils.visualization import format_minimal_list_with_elements
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -204,7 +206,11 @@ def build_probe_argv(kind: str, params: dict[str, Any] | None = None) -> list[st
 
 
 async def _execute_probe(ctx: ArtemisContext, argv: list[str]) -> str:
-    """Executes a validated probe argv over the ADB device channel."""
+    """Executes a validated probe argv over the ADB device channel.
+
+    A failed probe answers with a :class:`ToolFailure` so the tool loop marks
+    the result as an error structurally rather than by its wording.
+    """
     try:
         adb_client = ctx.get_adb_client()
         device = adb_client.device(serial=ctx.device.device_id)
@@ -214,7 +220,7 @@ async def _execute_probe(ctx: ArtemisContext, argv: list[str]) -> str:
             text = text[:_PROBE_OUTPUT_LIMIT] + "\n... [output truncated]"
         return text
     except Exception as e:
-        return f"Error executing probe: {e}"
+        return ToolFailure(f"Error executing probe: {e}")
 
 
 def get_probe_tool(ctx: ArtemisContext) -> BaseTool:
@@ -230,7 +236,7 @@ def get_probe_tool(ctx: ArtemisContext) -> BaseTool:
         try:
             argv = build_probe_argv(kind, params)
         except ValueError as e:
-            return f"Error: {e}"
+            return ToolFailure(f"Error: {e}")
         return await _execute_probe(ctx, argv)
 
     return probe_device
@@ -313,29 +319,82 @@ def build_checker_tools(
 # --- History formatting --------------------------------------------------------------
 
 
-def _format_history(ctx: ArtemisContext, limit: int = 60) -> str:
+def _load_steps(ctx: ArtemisContext) -> list[dict] | str:
+    """The agent-friendly step records, or the reason they are unavailable."""
     if not ctx.data_engine:
         return "No execution history available."
     try:
-        steps = ctx.data_engine.get_agent_friendly_steps() or []
+        return list(ctx.data_engine.get_agent_friendly_steps() or [])
     except Exception as e:
         return f"Failed to load execution history: {e}"
+
+
+def _step_offset_label(step: dict, session_start: float | None) -> str:
+    """Session-relative ``T+mm:ss`` label of a step: the clock every agent shares.
+
+    The recorded timestamp against the session start is authoritative; a
+    record that only carries the engine's ``"97.7s"`` label is converted.
+    """
+    from artemis.memory.transcript import format_session_offset
+
+    ts = step.get("timestamp")
+    if isinstance(session_start, (int, float)) and isinstance(ts, (int, float)):
+        return format_session_offset(float(ts) - float(session_start))
+    rel = str(step.get("relative_time") or "").strip()
+    if rel.startswith("T+"):
+        return rel
+    if rel.endswith("s"):
+        try:
+            return format_session_offset(float(rel[:-1]))
+        except ValueError:
+            pass
+    return "T+??:??"
+
+
+def _format_history(ctx: ArtemisContext, limit: int = 60, steps: list[dict] | None = None) -> str:
+    if steps is None:
+        steps = _load_steps(ctx)
+    if isinstance(steps, str):
+        return steps
     if not steps:
         return "No execution history available."
+    session_start = getattr(ctx.data_engine, "session_start_time", None)
     lines = []
     for s in steps[-limit:]:
         num = s.get("step_number")
-        rel = s.get("relative_time", "")
-        summary = s.get("summary") or ""
+        summary = (s.get("summary") or "").strip()
         action = s.get("action_taken")
+        if not summary and not action:
+            # Nothing to audit on this step: an empty row is only noise.
+            continue
         action_str = ""
         if action and not summary:
+            # The shared renderer keeps the target's provenance visible: a
+            # self-described coordinate target reads "'play button' (self-described)",
+            # an observed index target reads "'Login'" with no marker.
             try:
-                action_str = json.dumps(action, ensure_ascii=False)[:160]
+                action_str = format_actions_clean(action)[:160]
             except Exception:
                 action_str = str(action)[:160]
-        lines.append(f"- Step {num} ({rel}): {summary or action_str}".rstrip())
-    return "\n".join(lines)
+        label = _step_offset_label(s, session_start)
+        lines.append(f"- Step {num} ({label}): {summary or action_str}".rstrip())
+    return "\n".join(lines) or "No execution history available."
+
+
+def _format_user_guidance(ctx: ArtemisContext, steps: list[dict] | None = None) -> str:
+    """Every mid-run user instruction, read from the step it was stamped on."""
+    if steps is None:
+        steps = _load_steps(ctx)
+    if isinstance(steps, str) or not steps:
+        return "(none)"
+    session_start = getattr(ctx.data_engine, "session_start_time", None)
+    lines = []
+    for s in steps:
+        instruction = (s.get("extra_metadata") or {}).get("injected_instruction")
+        if isinstance(instruction, str) and instruction.strip():
+            label = _step_offset_label(s, session_start)
+            lines.append(f'- Step {s.get("step_number")} ({label}): "{instruction.strip()}"')
+    return "\n".join(lines) or "(none)"
 
 
 def _format_check_items(check_items: list) -> str:
@@ -456,7 +515,7 @@ async def _run_check_loop(
                     tool=tool_to_run, args=args, tool_call_id=tc["id"]
                 )
                 text, _ = split_multimodal_result(result_obj)
-                status = "error" if text.startswith("Error") else "success"
+                status = "error" if is_tool_failure(result_obj) else "success"
             except Exception as e:
                 result_obj = f"Error running tool {tool_name}: {e}"
                 status = "error"
@@ -764,14 +823,16 @@ async def run_final_check(
     )
 
     screenshot_b64, minimal_list = await _capture_final_screen(ctx)
+    steps = _load_steps(ctx)
 
     human_text = (
         f"# User's Original Goal\n{goal}\n\n"
+        f"# User guidance received during the run\n{_format_user_guidance(ctx, steps)}\n\n"
         f"# Final Task Plan\n{plan_text or '(no plan)'}\n\n"
         f"# Declared Check Items\n{_format_check_items(items)}\n\n"
         f"# Verdict Ledger (checkpoint results, authoritative for on_complete"
         f" items)\n{_format_ledger(ledger)}\n\n"
-        f"# Execution History (summaries)\n{_format_history(ctx)}\n\n"
+        f"# Execution History (summaries)\n{_format_history(ctx, steps=steps)}\n\n"
         f"# Final Screen Elements\n{minimal_list}"
     )
 

@@ -19,6 +19,7 @@ from uuid import uuid4
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
+from artemis.core.tool_failure import is_tool_failure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import (
     TraceSpan,
@@ -28,6 +29,7 @@ from artemis.data_engine.trace import (
 from artemis.graph.state import State
 from artemis.graph.visibility import strict_state
 from artemis.mcp.action_specs import OPERATOR_SHELL_ORDER, operator_shell_tool
+from artemis.llm.google import usage_from_message
 from artemis.services.llm import acomplete, get_llm, invoke_llm_with_timeout_message
 from artemis.tools.command_tool import (
     analyze_task_output_wrapper,
@@ -45,14 +47,13 @@ from artemis.utils.coordinates import (
     compute_smart_swipe_coordinates,
     parse_swipe_parameters,
 )
-from artemis.utils.decorators import wrap_with_callbacks
-from artemis.utils.element_hit_test import find_element_at_point
-from artemis.utils.logger import get_logger
 from artemis.utils.notes import get_note_file_path
 from artemis.utils.plan_grammar import parse_plan
 from artemis.memory.context_policy import build_history_for
 from artemis.utils.task_tree import get_active_subgoal_hashes
 from artemis.utils.visualization import format_minimal_list_with_elements
+from third_party.mobile_use.utils.decorators import agent_lifecycle_logging
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -70,6 +71,9 @@ DEFERRING_TOOLS = {
     "ask_explorer",
 }
 
+# Bare key names press_key accepts (case-insensitive, optional KEYCODE_ prefix).
+SUPPORTED_PRESS_KEYS = ("ENTER", "BACK", "HOME", "APP_SWITCH")
+
 from artemis.agents.operator.prompts import (
     OPERATOR_MAX_TOOL_ITERATIONS,
     PromptBuilder,
@@ -81,15 +85,22 @@ from artemis.agents.operator.prompts import (
     HistoricalStateHintPromptComponent,
     FeedbackPromptComponent,
     ExecutionIncidentPromptComponent,
-    CheckItemsExplainerPromptComponent,
     BackgroundTasksPromptComponent,
     render_plan_ledger_bounce,
+    ReasoningReminderPromptComponent,
     unwritten_action_streak,
     ToolLimitWarningPromptComponent,
     InjectedInstructionPromptComponent,
     render_transcript_static_system,
 )
 from artemis.agents.operator.prompts import load_operator_prompts
+
+
+def _described(value: Any) -> str | None:
+    """Trim target_description, returning None for missing or blank values."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 class OperatorNode:
@@ -129,6 +140,24 @@ class OperatorNode:
         self._transcript_turn_base: int | None = None
         self._turn_plan_baseline: str | None = None
         self._turn_ledger_streak: int = 0
+        # Whether the previous turn's replies carried no visible reasoning text;
+        # the next observation tail then carries a one-line reminder (no extra
+        # model call). Legacy-path fallback only: with a transcript ledger the
+        # ledger's own ``last_turn_silent`` is authoritative.
+        self._previous_turn_silent: bool = False
+
+    def _previous_turn_was_silent(self) -> bool:
+        """Whether the previous turn carried no visible reasoning text.
+
+        The transcript ledger judges its committed turns itself; the local flag
+        only serves the legacy path, which has no ledger.
+        """
+        from artemis.memory import TranscriptLedger
+
+        ledger = getattr(self.ctx, "transcript_ledger", None)
+        if isinstance(ledger, TranscriptLedger):
+            return bool(ledger.last_turn_silent)
+        return self._previous_turn_silent
 
     def _available_device_actions(self) -> frozenset[str]:
         """Device actions the installed actuator backend provides.
@@ -217,7 +246,6 @@ class OperatorNode:
                     TemplatePromptComponent(),
                     {"template_name": "main_template"},
                 ),
-                (CheckItemsExplainerPromptComponent(), {}),
                 (ExecutionIncidentPromptComponent(), {}),
                 (ObservationPromptComponent(), {}),
                 (ScreenshotSimilarityPromptComponent(), {}),
@@ -225,10 +253,14 @@ class OperatorNode:
                 (InjectedInstructionPromptComponent(), {}),
                 (BackgroundTasksPromptComponent(), {}),
                 (FeedbackPromptComponent(), {}),
+                (ReasoningReminderPromptComponent(), {}),
                 (ToolLimitWarningPromptComponent(), {}),
             ]
         else:
-            components = [(c, {}) for c in components] + [(ToolLimitWarningPromptComponent(), {})]
+            components = [(c, {}) for c in components] + [
+                (ReasoningReminderPromptComponent(), {}),
+                (ToolLimitWarningPromptComponent(), {}),
+            ]
 
         # Active and finished tasks are now passed as arguments
         active_tasks = active_background_tasks or []
@@ -244,6 +276,7 @@ class OperatorNode:
                 "current_step_num": current_step_num,
                 "active_background_tasks": active_tasks,
                 "newly_finished_tasks": newly_finished,
+                "previous_turn_silent": self._previous_turn_was_silent(),
                 "steps": steps,
             }
             kwargs_to_pass.update(extra_kwargs)
@@ -272,6 +305,9 @@ class OperatorNode:
             image_scrub_depth=getattr(cfg, "image_scrub_depth", 3),
             pending_grace_steps=getattr(cfg, "pending_grace_steps", 3),
             xml_scrub_depth=getattr(cfg, "xml_scrub_depth", 1),
+            image_scrub_depth_relaxed=getattr(cfg, "image_scrub_depth_relaxed", None),
+            context_budget_tokens=getattr(cfg, "context_budget_tokens", None),
+            start_ratio=getattr(cfg, "start_ratio", None),
             session_start=session_start if isinstance(session_start, (int, float)) else None,
         )
         # L2/L3 chunk compression (M3) rides the same flag; without a
@@ -329,6 +365,8 @@ class OperatorNode:
         """
         from langchain_core.messages import HumanMessage
 
+        from artemis.memory.transcript import mark_ephemeral
+
         ledger = self._ensure_transcript_ledger(state)
 
         # 1. S region: rendered exactly once per session.
@@ -379,7 +417,6 @@ class OperatorNode:
         builder.add_human_content(f"# CURRENT OBSERVATION [{ledger.elapsed_label()}]")
         components = [
             (PlanRecitationPromptComponent(), {}),
-            (CheckItemsExplainerPromptComponent(), {}),
             (ExecutionIncidentPromptComponent(), {}),
             (ObservationPromptComponent(), {}),
             (ScreenshotSimilarityPromptComponent(), {}),
@@ -387,6 +424,7 @@ class OperatorNode:
             (InjectedInstructionPromptComponent(), {}),
             (BackgroundTasksPromptComponent(), {}),
             (FeedbackPromptComponent(), {}),
+            (ReasoningReminderPromptComponent(), {}),
             (ToolLimitWarningPromptComponent(), {}),
         ]
         for component, extra_kwargs in components:
@@ -399,6 +437,7 @@ class OperatorNode:
                 "active_background_tasks": active_background_tasks or [],
                 "newly_finished_tasks": newly_finished_tasks or [],
                 "steps": steps,
+                "previous_turn_silent": self._previous_turn_was_silent(),
             }
             kwargs_to_pass.update(extra_kwargs)
             await component(builder, state, self.ctx, **kwargs_to_pass)
@@ -410,6 +449,10 @@ class OperatorNode:
             else:
                 tail_content.append(part)
         tail = HumanMessage(content=tail_content)
+        # Per-turn notices (reminders, hints, guidance, incident blocks) are
+        # deleted by the scrub edge once the turn leaves the recent window.
+        if builder.ephemeral_indices:
+            mark_ephemeral(tail, builder.ephemeral_indices)
 
         messages = ledger.render([tail])
         self._transcript_turn_base = len(messages) - 1
@@ -462,25 +505,28 @@ class OperatorNode:
             bound_llm = base_llm.bind_tools(tools=traced_tools)
             response = await invoke_llm_with_timeout_message(acomplete(bound_llm, current_messages))
 
-            if hasattr(response, "response_metadata") and response.response_metadata:
-                usage = (
-                    response.response_metadata.get("usage_metadata")
-                    or response.response_metadata.get("token_usage")
-                    or {}
+            usage = usage_from_message(response)
+            # The ledger's compaction thresholds read the operator's own
+            # prompt size, never the session-wide meter (which the
+            # Planner/Checker/sub-agent calls overwrite). The messages ride
+            # along so the ledger can calibrate its chars-per-token ratio.
+            transcript_ledger = getattr(self.ctx, "transcript_ledger", None)
+            if usage is not None:
+                logger.info(
+                    f"LLM usage: prompt_tokens={usage['prompt_tokens']}"
+                    f" (cached={usage['cached_tokens']}),"
+                    f" completion_tokens={usage['completion_tokens']}"
                 )
-                prompt_tokens = usage.get("prompt_token_count") or usage.get("prompt_tokens")
-                cached_tokens = usage.get("cached_content_token_count") or usage.get(
-                    "cached_tokens", 0
-                )
-                completion_tokens = usage.get("candidates_token_count") or usage.get(
-                    "completion_tokens"
-                )
-                if prompt_tokens is not None:
-                    logger.info(
-                        f"LLM usage: prompt_tokens={prompt_tokens}"
-                        f" (cached={cached_tokens}),"
-                        f" completion_tokens={completion_tokens}"
+                if hasattr(transcript_ledger, "record_prompt_tokens"):
+                    transcript_ledger.record_prompt_tokens(
+                        usage.get("prompt_tokens"), messages=current_messages
                     )
+            elif hasattr(transcript_ledger, "record_prompt_tokens"):
+                # No usage metadata from the provider: record an estimate so
+                # the start gate and thresholds still see a context base.
+                from artemis.memory.transcript import estimate_prompt_tokens
+
+                transcript_ledger.record_prompt_tokens(estimate_prompt_tokens(current_messages))
 
             if response.content:
                 if isinstance(response.content, str):
@@ -589,30 +635,10 @@ class OperatorNode:
                                 )
 
                                 content = get_tool_result_content(result_obj)
-                                status = "success"
-
-                                if isinstance(result_obj, ToolMessage) and result_obj.status:
-                                    status = result_obj.status
-
-                                is_err = status == "error"
-                                if not is_err:
-                                    if isinstance(content, str):
-                                        if content.startswith(
-                                            "Failed"
-                                        ) or content.lower().startswith("error"):
-                                            is_err = True
-                                    elif isinstance(content, list):
-                                        for block in content:
-                                            if (
-                                                isinstance(block, dict)
-                                                and block.get("type") == "text"
-                                            ):
-                                                text = block.get("text", "")
-                                                if text.startswith(
-                                                    "Failed"
-                                                ) or text.lower().startswith("error"):
-                                                    is_err = True
-                                                    break
+                                # Failure is structural (a ToolMessage status or a
+                                # ToolFailure text), never sniffed from the words.
+                                is_err = is_tool_failure(result_obj)
+                                status = "error" if is_err else "success"
 
                                 if is_err:
                                     other_tool_failed = True
@@ -662,18 +688,22 @@ class OperatorNode:
                             "Scratchpad/helper tool call failed. Deferring"
                             f" screen actions: {other_tool_failure_msg}"
                         )
-                        for tc in action_calls:
+                        # Every rejected call needs its own ToolMessage, but the
+                        # full explanation travels once; the rest point at it.
+                        for idx, tc in enumerate(action_calls):
                             tool_outputs.append(
                                 ToolMessage(
                                     tool_call_id=tc["id"],
+                                    name=normalize_name(tc["name"]),
                                     content=(
-                                        "This screen action was rejected"
-                                        " because an accompanying tool call"
-                                        " failed. Error:"
-                                        f" {other_tool_failure_msg}. Currently,"
-                                        " no screen actions have been"
-                                        " executed. Please correct the error"
-                                        " and try again."
+                                        "Not executed: this screen action was"
+                                        " rejected because an accompanying tool"
+                                        f" call failed. Error: {other_tool_failure_msg}."
+                                        " No screen action ran this turn. Correct"
+                                        " the error, then re-issue the action."
+                                        if idx == 0
+                                        else "Not executed: see the accompanying"
+                                        " tool-call error above."
                                     ),
                                     status="error",
                                 )
@@ -691,25 +721,23 @@ class OperatorNode:
                             " Deferring terminal actions."
                         )
 
-                        for tc in action_calls:
+                        for idx, tc in enumerate(action_calls):
                             tool_outputs.append(
                                 ToolMessage(
                                     tool_call_id=tc["id"],
+                                    name=normalize_name(tc["name"]),
                                     content=(
-                                        "Your pre-decision tools have been"
-                                        " successfully processed. However, the"
-                                        " screen action you attempted to"
-                                        " execute was rejected because you are"
-                                        " not allowed to simultaneously"
-                                        " use result-dependent pre-decision"
-                                        " tools and execute physical actions in"
-                                        " the same turn."
-                                        " Currently, no screen actions have"
-                                        " been executed. Please review your"
-                                        " updated context and re-output your"
-                                        " intended screen action."
+                                        "Not executed: this screen action was"
+                                        " deferred because the same turn also"
+                                        " called a result-dependent pre-decision"
+                                        " tool. No screen action ran this turn."
+                                        " Read the tool results above, then"
+                                        " re-issue the action."
+                                        if idx == 0
+                                        else "Not executed: deferred for the same"
+                                        " reason as the screen action above."
                                     ),
-                                    status="success",
+                                    status="error",
                                 )
                             )
 
@@ -737,24 +765,36 @@ class OperatorNode:
                     logger.info(f"Plan ledger gate: bouncing action. {bounce}")
                     for tc in action_calls:
                         tool_outputs.append(
-                            ToolMessage(tool_call_id=tc["id"], content=bounce, status="error")
+                            ToolMessage(
+                                tool_call_id=tc["id"],
+                                name=normalize_name(tc["name"]),
+                                content=bounce,
+                                status="error",
+                            )
                         )
                     action_calls_to_translate = []
                 elif len(action_calls) > burst_cap:
                     # A multi-action turn is a fast-action burst that the Validator
                     # fires without the safety net; cap its length before it runs.
                     validation_errors = True
-                    for tc in action_calls:
+                    burst_error = (
+                        f"Error: {len(action_calls)} Turn-Ending Actions in one"
+                        " turn exceed the fast-action burst limit of"
+                        f" {burst_cap}. Nothing was executed. Re-issue at most"
+                        f" {burst_cap} actions (a burst is for sub-second"
+                        " sequences on transient UI, not for batching normal"
+                        " steps), or a single vetted action."
+                    )
+                    # One ToolMessage per rejected call, full text only on the first.
+                    for idx, tc in enumerate(action_calls):
                         tool_outputs.append(
                             ToolMessage(
                                 tool_call_id=tc["id"],
+                                name=normalize_name(tc["name"]),
                                 content=(
-                                    f"Error: {len(action_calls)} Turn-Ending Actions in one"
-                                    " turn exceed the fast-action burst limit of"
-                                    f" {burst_cap}. Nothing was executed. Re-issue at most"
-                                    f" {burst_cap} actions (a burst is for sub-second"
-                                    " sequences on transient UI, not for batching normal"
-                                    " steps), or a single vetted action."
+                                    burst_error
+                                    if idx == 0
+                                    else "Not executed: see the burst-limit error above."
                                 ),
                                 status="error",
                             )
@@ -774,6 +814,7 @@ class OperatorNode:
                         tool_outputs.append(
                             ToolMessage(
                                 tool_call_id=tc["id"],
+                                name=normalize_name(tc["name"]),
                                 content=error,
                                 status="error",
                             )
@@ -783,6 +824,7 @@ class OperatorNode:
                         tool_outputs.append(
                             ToolMessage(
                                 tool_call_id=tc["id"],
+                                name=normalize_name(tc["name"]),
                                 content="Action Recorded",
                                 status="success",
                             )
@@ -812,49 +854,7 @@ class OperatorNode:
             tool_limit_exceeded,
         )
 
-    async def _run_other_tool(
-        self,
-        tc,
-        traced_tools,
-        new_subagent_calls,
-        state: State,
-        raw_thoughts: list,
-        native_thoughts: list,
-    ) -> str:
-        tool_name = tc["name"]
-        logger.info(f"Operator requested tool: {tool_name}")
-        if tool_name in ["ask_diagnoser", "video_analyzer"]:
-            new_subagent_calls.append(tool_name)
-        if ":" in tool_name:
-            tool_to_run = get_tool_by_name(tool_name, traced_tools)
-        else:
-            tool_to_run = next((t for t in traced_tools if t.name == tool_name), None)
-        if tool_to_run:
-            try:
-                args = dict(tc["args"])
-
-                state.operator_raw_thinking = "\n".join(raw_thoughts) if raw_thoughts else None
-                state.operator_native_thinking = (
-                    "\n".join(native_thoughts) if native_thoughts else None
-                )
-
-                result_obj = await invoke_tool_with_injection(
-                    tool=tool_to_run,
-                    args=args,
-                    tool_call_id=tc["id"],
-                    state=state,
-                )
-                return get_tool_result_content(result_obj)
-            except Exception as e:
-                return f"Error running tool {tool_name}: {e}"
-        else:
-            return f"Error: Tool {tool_name} not supported"
-
-    @wrap_with_callbacks(
-        before=lambda: logger.info("Starting Operator Agent..."),
-        on_success=lambda _: logger.success("Operator Agent"),
-        on_failure=lambda _: logger.error("Operator Agent"),
-    )
+    @agent_lifecycle_logging("Operator", logger)
     @trace(type="agent", name="operator")
     async def __call__(self, state: State):
         state = strict_state(state, "operator")
@@ -958,6 +958,7 @@ class OperatorNode:
             new_subagent_calls=new_subagent_calls,
             state=state,
         )
+        self._previous_turn_silent = not (raw_thinking and raw_thinking.strip())
 
         # 8b. Transcript path: hold this turn's messages (observation tail +
         # tool-loop products) for commit at the next build, when the turn's
@@ -1110,9 +1111,13 @@ class OperatorNode:
             except (AttributeError, TypeError):
                 pass
 
-        def resolve_target_element(
-            target: Any,
-        ) -> tuple[dict | None, str | None]:
+        def resolve_target_element(target: Any, description: Any) -> tuple[dict | None, str | None]:
+            """Resolves a target to ``{"center": [x, y], **semantics}``.
+
+            An element index carries observed semantics (text, bounds, id, class
+            straight from the indexed list); a coordinate pair carries only the
+            model's own ``target_description``. The two never mix.
+            """
             if isinstance(target, (int, float)):
                 try:
                     target_int = int(target)
@@ -1120,7 +1125,14 @@ class OperatorNode:
                     return None, f"Error: Invalid target index {target}."
                 indexed_elements = getattr(state, "indexed_elements", None) or []
                 if 1 <= target_int <= len(indexed_elements):
-                    return {**indexed_elements[target_int - 1], "label_source": "index"}, None
+                    el = indexed_elements[target_int - 1]
+                    return {
+                        "center": el.get("center"),
+                        "target_text": el.get("text"),
+                        "target_bounds": el.get("bounds"),
+                        "target_resource_id": el.get("resource_id"),
+                        "target_class": el.get("class"),
+                    }, None
                 return (
                     None,
                     (
@@ -1129,26 +1141,21 @@ class OperatorNode:
                     ),
                 )
             elif isinstance(target, list) and len(target) == 2:
+                described = _described(description)
+                if described is None:
+                    return (
+                        None,
+                        (
+                            f"Error: Coordinate target {target} requires"
+                            " 'target_description' (what the element is, in a few"
+                            " words). Provide it, or address the element by index."
+                        ),
+                    )
                 try:
                     nx, ny = map(float, target)
                     x = int(max(0, min(width - 1, nx * width / 1000)))
                     y = int(max(0, min(height - 1, ny * height / 1000)))
-                    # Record-time enrichment: a bare-coordinate target carries no
-                    # element semantics, so hit test the pre-action frame's indexed
-                    # elements to best-effort recover what sits under the point.
-                    hit_el, hit_source = find_element_at_point(
-                        getattr(state, "indexed_elements", None), x, y
-                    )
-                    hit_el = hit_el or {}
-                    return {
-                        "center": [x, y],
-                        "text": hit_el.get("text"),
-                        "bounds": hit_el.get("bounds"),
-                        "class": hit_el.get("class"),
-                        "resource_id": hit_el.get("resource_id"),
-                        "is_ocr": bool(hit_el.get("is_ocr")),
-                        "label_source": hit_source,
-                    }, None
+                    return {"center": [x, y], "target_description": described}, None
                 except (ValueError, TypeError):
                     return (
                         None,
@@ -1162,11 +1169,15 @@ class OperatorNode:
                 ),
             )
 
+        def target_fields(el: dict) -> dict:
+            """The recorded target semantics: observed (index) or described (coords)."""
+            return {k: v for k, v in el.items() if k != "center"}
+
         if tool_name == "click":
             target = args.get("target")
             times = args.get("times", 1)
             delay_ms = args.get("delay_ms", 100)
-            el, err = resolve_target_element(target)
+            el, err = resolve_target_element(target, args.get("target_description"))
             if err:
                 return [], err
             norm_c = [
@@ -1181,18 +1192,14 @@ class OperatorNode:
                     "normalized_coordinates": norm_c,
                     "times": times,
                     "delay_ms": delay_ms,
-                    "target_text": el.get("text"),
-                    "target_bounds": el.get("bounds"),
-                    "target_resource_id": el.get("resource_id"),
-                    "target_class": el.get("class"),
-                    "target_label_source": el.get("label_source", "none"),
+                    **target_fields(el),
                 }
             ], None
 
         elif tool_name == "long_press":
             target = args.get("target")
             duration = args.get("duration", 1000)
-            el, err = resolve_target_element(target)
+            el, err = resolve_target_element(target, args.get("target_description"))
             if err:
                 return [], err
             norm_c = [
@@ -1206,11 +1213,7 @@ class OperatorNode:
                     COORDINATE_SPACE_KEY: COORDINATE_SPACE_PIXEL,
                     "normalized_coordinates": norm_c,
                     "duration": duration,
-                    "target_text": el.get("text"),
-                    "target_bounds": el.get("bounds"),
-                    "target_resource_id": el.get("resource_id"),
-                    "target_class": el.get("class"),
-                    "target_label_source": el.get("label_source", "none"),
+                    **target_fields(el),
                 }
             ], None
 
@@ -1227,7 +1230,7 @@ class OperatorNode:
                     (f"Error: 'text' must be a string, got {type(text).__name__}."),
                 )
 
-            el, err = resolve_target_element(target)
+            el, err = resolve_target_element(target, args.get("target_description"))
             if err:
                 return [], err
 
@@ -1244,11 +1247,7 @@ class OperatorNode:
                     "normalized_coordinates": norm_c,
                     "text": text,
                     "clear_before_input": clear_exist,
-                    "target_text": el.get("text"),
-                    "target_bounds": el.get("bounds"),
-                    "target_resource_id": el.get("resource_id"),
-                    "target_class": el.get("class"),
-                    "target_label_source": el.get("label_source", "none"),
+                    **target_fields(el),
                 }
             )
             return actions, None
@@ -1271,6 +1270,9 @@ class OperatorNode:
             else:
                 duration = parsed_duration
 
+            # Only a coordinate gesture needs the model to say what it drags; a
+            # directional scroll targets the page, not an element.
+            described: str | None = None
             if kind == "direction":
                 x1, y1, x2, y2, smart_dur = compute_smart_swipe_coordinates(
                     direction=target,
@@ -1284,6 +1286,16 @@ class OperatorNode:
                 if duration is None:
                     duration = smart_dur
             elif kind == "coords" and isinstance(target, list) and len(target) == 4:
+                described = _described(args.get("target_description"))
+                if described is None:
+                    return (
+                        [],
+                        (
+                            f"Error: Coordinate swipe {target} requires"
+                            " 'target_description' (what is being dragged, in a few"
+                            " words). Provide it, or use a directional swipe."
+                        ),
+                    )
                 try:
                     nx1, ny1, nx2, ny2 = map(float, target)
                     x1 = int(max(0, min(width - 1, nx1 * width / 1000)))
@@ -1327,6 +1339,11 @@ class OperatorNode:
                     "normalized_start_coordinates": [nx1, ny1],
                     "normalized_end_coordinates": [nx2, ny2],
                     "duration": duration,
+                    # A directional scroll keeps the direction the agent issued so
+                    # history and replays render "Swiped up (...)" rather than a
+                    # bare coordinate path.
+                    **({"direction": str(target)} if kind == "direction" else {}),
+                    **({"target_description": described} if described else {}),
                 }
             ], None
 
@@ -1340,9 +1357,15 @@ class OperatorNode:
                     f"Error: 'key' must be a string, got {type(key).__name__}.",
                 )
 
-            normalized_key = key[8:] if key.startswith("KEYCODE_") else key
-            if normalized_key not in ["ENTER", "BACK", "HOME", "APP_SWITCH"]:
-                return [], f"Error: Unsupported key '{key}'."
+            normalized_key = key.strip().upper()
+            if normalized_key.startswith("KEYCODE_"):
+                normalized_key = normalized_key[len("KEYCODE_") :]
+            if normalized_key not in SUPPORTED_PRESS_KEYS:
+                return (
+                    [],
+                    f"Error: Unsupported key '{key}'. Supported keys:"
+                    f" {', '.join(SUPPORTED_PRESS_KEYS)}.",
+                )
             return [{"action": "press_key", "keycode": f"KEYCODE_{normalized_key}"}], None
 
         elif tool_name == "manage_app":

@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -44,8 +45,8 @@ from artemis.utils.coordinates import (
     normalize_any_structure,
     normalize_step_actions,
 )
-from artemis.utils.logger import get_logger
 from artemis.utils.text import safe_extract_text
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -666,6 +667,13 @@ class DataEngine:
         if session and session.end_time is not None and session.status not in ("running", "paused"):
             logger.debug(f"Session end already published for {session_id}; skipping duplicate")
             return
+        # Session-level LLM usage line (cache-hit ratios per source), best-effort.
+        try:
+            from artemis.services.token_meter import log_session_summary
+
+            log_session_summary(session_id)
+        except Exception as e:
+            logger.debug(f"Session usage summary skipped: {e}")
         if session:
             session.end_time = end_time
             session.status = status
@@ -778,6 +786,19 @@ class DataEngine:
         except Exception as e:
             logger.error(f"Failed to record video failure in DataEngine: {e}")
 
+    def update_session_device_info(self, **fields: Any) -> None:
+        """Merge ``fields`` into the running session's ``device_info`` record."""
+        if not self.storage or not self.current_session_id:
+            return
+        try:
+            session = self.storage.get_session(self.current_session_id)
+            if session is None:
+                return
+            session.device_info = {**(session.device_info or {}), **fields}
+            self.storage.update_session(session)
+        except (OSError, ValueError, sqlite3.Error) as e:
+            logger.warning(f"Failed to update session device_info in DataEngine: {e}")
+
     def update_video_path(self, local_video_path: str | Path):
         """Update the video path across tables when traces or videos are moved."""
         if not self.storage or not self.current_session_id:
@@ -877,7 +898,7 @@ class DataEngine:
         if pre_image_name and post_image_name and pre_image_name == post_image_name:
             post_image_name = None
 
-        # M5: persist the foreground app for the recall search surface (the
+        # Persist the foreground app for the recall search surface (the
         # parameter was historically accepted but never stored). The explicit
         # parameter wins; otherwise it is derived best-effort from the UI
         # tree's package attributes — a pure string scan, no device call.
@@ -889,7 +910,7 @@ class DataEngine:
         except (AttributeError, TypeError, ValueError):
             pass
 
-        # M4: stamp perceptual hashes for the local screen-similarity hint
+        # Stamp perceptual hashes for the local screen-similarity hint
         # (pure PIL dHash; best-effort, computed synchronously to keep the
         # record immutable once handed to the background writer).
         try:

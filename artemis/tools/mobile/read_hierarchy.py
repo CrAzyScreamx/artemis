@@ -18,14 +18,15 @@ from typing import Any
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import trace_langchain_tool
 from artemis.drivers.base import BaseDeviceDriver
 from artemis.graph.state import State
 from artemis.tools.base import ArtemisTool, ToolCategory
 from artemis.tools.tool_wrapper import ToolWrapper
-from artemis.tools.types import CyFunctionDetector
-from artemis.utils.logger import get_logger
+from artemis.utils.cython_compat import CyFunctionDetector
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -75,16 +76,18 @@ class GetUiHierarchyTool(ArtemisTool):
                 xml_hierarchy = getattr(screen_data, "ui_hierarchy_xml", None)
                 if xml_hierarchy:
                     return str(xml_hierarchy)
-                return "Error retrieving UI hierarchy: No UI hierarchy in screen data."
+                return ToolFailure("Error retrieving UI hierarchy: No UI hierarchy in screen data.")
             if driver is not None and hasattr(driver, "get_ui_hierarchy"):
                 xml_hierarchy = await driver.get_ui_hierarchy()
                 if inspect.iscoroutine(xml_hierarchy):
                     xml_hierarchy = await xml_hierarchy
                 return str(xml_hierarchy)
-            return "Error retrieving UI hierarchy: No UI Automator client or driver provided."
+            return ToolFailure(
+                "Error retrieving UI hierarchy: No UI Automator client or driver provided."
+            )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Failed to get UI hierarchy: {e}")
-            return f"Error retrieving UI hierarchy: {e}"
+            return ToolFailure(f"Error retrieving UI hierarchy: {e}")
 
 
 # Universal tool instance & aliases

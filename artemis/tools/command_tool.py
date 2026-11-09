@@ -47,16 +47,17 @@ import uuid
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.agents.log_analyzer.output_analyzer import TaskOutputAnalyzerNode
 from artemis.context import ArtemisContext
-from artemis.controllers.platform_specific_commands_controller import (
-    get_adb_device,
-)
 from artemis.data_engine.trace import trace_langchain_tool
 from artemis.drivers.base import BaseDeviceDriver
 from artemis.tools.base import ArtemisTool
 from artemis.tools.tool_wrapper import ToolWrapper
-from artemis.utils.logger import get_logger
+from third_party.mobile_use.controllers.platform_specific_commands_controller import (
+    get_adb_device,
+)
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -124,21 +125,50 @@ def _adb_binary() -> str:
         return "adb"
 
 
+#: Inline display cap for command output, in characters. Beyond it the full
+#: text is cached under a TaskId and only the tail is shown to the model.
+_LONG_OUTPUT_CHARS = 50000
+
+#: How many trailing lines of an over-long output stay visible inline.
+_LONG_OUTPUT_TAIL_LINES = 200
+
+
 def _is_output_long(output: str) -> bool:
-    """Checks if command output exceeds the max threshold for inline display."""
-    return len(output.splitlines()) > 500 or len(output) > 50000
+    """Whether command output is too long to show inline.
+
+    The trigger is size alone: more than ``_LONG_OUTPUT_CHARS`` characters.
+    A line count by itself never trips it, so a 1000-line / 4 KB listing
+    (``seq 1 1000``) is shown in full instead of being cut to its tail.
+    """
+    return len(output) > _LONG_OUTPUT_CHARS
 
 
-def _format_long_output_response(_task_id: str, output: str, intro: str) -> str:
+def _format_long_output_response(task_id: str, output: str, intro: str) -> str:
     """Formats truncated output with guidance to use the analyzer tool."""
     lines = output.splitlines()
-    last_200 = "\n".join(lines[-200:])
+    tail = "\n".join(lines[-_LONG_OUTPUT_TAIL_LINES:])
     return (
         f"{intro}\nWarning: Output is too long ({len(lines)} lines,"
-        f" {len(output)} chars) and has been truncated.\n--- Last 200 lines of"
-        f" output ---\n{last_200}\n------------------------\nYou can use the"
-        " 'analyze_task_output' tool to get more information."
+        f" {len(output)} chars) and has been truncated.\n--- Last"
+        f" {_LONG_OUTPUT_TAIL_LINES} lines of output ---\n{tail}\n"
+        f"------------------------\nThe full output is kept under TaskId"
+        f" {task_id}: use analyze_task_output with TaskId {task_id} to query it."
     )
+
+
+def _render_output_body(output: str) -> str:
+    """Renders command output for the model; whitespace-only output reads as empty."""
+    return output if output.strip() else "(empty output)"
+
+
+def _abbreviate(text: str, limit: int = 40) -> str:
+    """Cuts ``text`` to ``limit`` characters, marking the cut only when one happened."""
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def _terminal_label(terminal_id: str | None) -> str:
+    """Renders a terminal id for the model; a task without one shows as ``-``."""
+    return terminal_id or "-"
 
 
 def _filter_persistent_env(env: dict[str, str]) -> dict[str, str]:
@@ -681,7 +711,7 @@ class RunAdbCommandTool(ArtemisTool):
                     timeout=wait_seconds,
                 )
             except TimeoutError:
-                return (
+                return ToolFailure(
                     f"Error: Command did not finish within {wait_seconds:.1f}s."
                     " Background tasks are not available on this device"
                     " connection; bound the command (logcat -d, top -n 1,"
@@ -689,7 +719,7 @@ class RunAdbCommandTool(ArtemisTool):
                 )
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logger.error(f"Failed to execute virtual adb shell for '{cmd_line}': {e}")
-                return f"Failed to execute adb command: {e}"
+                return ToolFailure(f"Failed to execute adb command: {e}")
             clean_output, new_env, script_exit = BackgroundTask.parse_output(str(output))
             if run_persistent and new_env is not None:
                 registry.persistent_envs[terminal_id] = _filter_persistent_env(new_env)
@@ -699,8 +729,7 @@ class RunAdbCommandTool(ArtemisTool):
             intro += "."
             if run_persistent:
                 intro += f" TerminalID: {terminal_id}."
-            body = clean_output if clean_output.strip() else "(empty output)"
-            return f"{intro}\nOutput:\n{body}"
+            return f"{intro}\nOutput:\n{_render_output_body(clean_output)}"
 
         # We spawn the host subprocess: adb -s <serial> shell <script>.
         # The script travels as an argument so the remote shell exits with it;
@@ -720,7 +749,7 @@ class RunAdbCommandTool(ArtemisTool):
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Failed to spawn adb shell process for command '{cmd_line}': {e}")
-            return f"Failed to spawn adb process: {e}"
+            return ToolFailure(f"Failed to spawn adb process: {e}")
 
         stdout_data: list[str] = []
         try:
@@ -778,7 +807,7 @@ class RunAdbCommandTool(ArtemisTool):
             registry.finished[task_id]["notified"] = True
             return _format_long_output_response(task_id, clean_output, intro)
 
-        return f"{intro}\nOutput:\n{clean_output}"
+        return f"{intro}\nOutput:\n{_render_output_body(clean_output)}"
 
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     async def _hand_off_to_background(
@@ -895,8 +924,8 @@ class ManageTaskTool(ArtemisTool):
             active_tasks = []
             for tid, t in registry.background.items():
                 active_tasks.append(
-                    f"- {tid}: Command='{t.command[:40]}...', Phone"
-                    f" Cwd='{t.cwd}', TerminalID='{t.terminal_id}',"
+                    f"- {tid}: Command='{_abbreviate(t.command)}', Phone"
+                    f" Cwd='{t.cwd}', TerminalID={_terminal_label(t.terminal_id)},"
                     f" Interactive={t.interactive}"
                 )
             if not active_tasks:
@@ -907,7 +936,7 @@ class ManageTaskTool(ArtemisTool):
             finished_tasks = []
             for tid, t in registry.finished.items():
                 finished_tasks.append(
-                    f"- {tid}: Command='{t['command'][:40]}...', Status='{t['status']}'"
+                    f"- {tid}: Command='{_abbreviate(t['command'])}', Status='{t['status']}'"
                 )
             if not finished_tasks:
                 return "No recently finished tasks."
@@ -916,14 +945,14 @@ class ManageTaskTool(ArtemisTool):
             )
 
         if not task_id:
-            return "Error: TaskId is required for status, kill, or send_input actions."
+            return ToolFailure("Error: TaskId is required for status, kill, or send_input actions.")
 
         task = registry.background.get(task_id)
 
         if action == "status":
             task_info = _get_task_info(task_id, ctx)
             if not task_info:
-                return f"Task {task_id} not found."
+                return ToolFailure(f"Error: Task {task_id} not found.")
 
             output_text = task_info.get("output", "")
             if _ENV_START_MARKER in output_text:
@@ -934,7 +963,7 @@ class ManageTaskTool(ArtemisTool):
                 f"Status: {task_info.get('status')}\n"
                 f"Command: {task_info.get('command')}\n"
                 f"Cwd: {task_info.get('cwd')}\n"
-                f"TerminalID: {task_info.get('terminal_id')}"
+                f"TerminalID: {_terminal_label(task_info.get('terminal_id'))}"
             )
             exit_code = task_info.get("exit_code")
             if exit_code is not None:
@@ -947,29 +976,31 @@ class ManageTaskTool(ArtemisTool):
 
         if action == "kill":
             if not task:
-                return f"Task {task_id} is not active or already finished."
+                return ToolFailure(f"Error: Task {task_id} is not active or already finished.")
             try:
                 await task.stop(ctx, status="killed")
-                return f"Task {task_id} successfully terminated."
             except Exception as e:  # pylint: disable=broad-exception-caught
-                return f"Failed to terminate task {task_id}: {e}"
+                return ToolFailure(f"Failed to terminate task {task_id}: {e}")
+            if task.exit_code is not None:
+                return f"Terminated task {task_id} (exit code {task.exit_code})."
+            return f"Terminated task {task_id}."
 
         if action == "send_input":
             if not task:
-                return f"Task {task_id} is not active."
+                return ToolFailure(f"Error: Task {task_id} is not active.")
             if not input_str:
-                return "Error: Input is required for send_input action."
+                return ToolFailure("Error: Input is required for send_input action.")
             if not task.interactive or task.process.stdin is None:
-                return (
+                return ToolFailure(
                     f"Error: Task {task_id} was launched without Interactive=true, so its"
                     " stdin is closed. Relaunch the command with Interactive=true."
                 )
             try:
                 task.process.stdin.write(input_str.encode())
                 await task.process.stdin.drain()
-                return f"Input successfully sent to task {task_id}."
+                return f"Sent input to task {task_id}."
             except Exception as e:  # pylint: disable=broad-exception-caught
-                return f"Failed to send input: {e}"
+                return ToolFailure(f"Failed to send input: {e}")
 
         return "Unsupported action."
 
@@ -1065,9 +1096,9 @@ class RunShortAdbCommandTool(ArtemisTool):
                 )
                 return f"ADB command completed.\nOutput:\n{output}"
             except TimeoutError:
-                return f"Error: Command timed out after {timeout:.0f} seconds."
+                return ToolFailure(f"Error: Command timed out after {timeout:.0f} seconds.")
             except Exception as e:  # pylint: disable=broad-exception-caught
-                return f"Error running command: {e}"
+                return ToolFailure(f"Error running command: {e}")
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -1084,7 +1115,7 @@ class RunShortAdbCommandTool(ArtemisTool):
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Failed to spawn adb shell process for command '{cmd_line}': {e}")
-            return f"Failed to spawn adb process: {e}"
+            return ToolFailure(f"Failed to spawn adb process: {e}")
 
         try:
             stdout_data, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
@@ -1101,9 +1132,9 @@ class RunShortAdbCommandTool(ArtemisTool):
                     process.kill()
                 except (ProcessLookupError, OSError):
                     pass
-            return f"Error: Command timed out after {timeout:.0f} seconds."
+            return ToolFailure(f"Error: Command timed out after {timeout:.0f} seconds.")
         except Exception as e:  # pylint: disable=broad-exception-caught
-            return f"Error running command: {e}"
+            return ToolFailure(f"Error running command: {e}")
 
 
 # Universal tool instance & aliases
@@ -1181,7 +1212,7 @@ class AnalyzeTaskOutputTool(ArtemisTool):
 
         task_info = _get_task_info(task_id, ctx)
         if not task_info:
-            return f"Error: Task {task_id} not found."
+            return ToolFailure(f"Error: Task {task_id} not found.")
 
         analyzer = TaskOutputAnalyzerNode(ctx)
         result = await analyzer.run(

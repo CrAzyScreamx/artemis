@@ -18,14 +18,14 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools.base import BaseTool
 from pydantic import BaseModel, Field
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import trace_langchain_tool
 from artemis.drivers.base import BaseDeviceDriver
 from artemis.graph.state import State
 from artemis.tools.base import ArtemisTool
 from artemis.tools.tool_wrapper import ToolWrapper
-from artemis.tools.types import CyFunctionDetector
-from artemis.utils.logger import get_logger
+from artemis.utils.cython_compat import CyFunctionDetector
 from artemis.utils.notes import (
     APPEND_NOTE_ARG_CONTENT_DESC,
     APPEND_NOTE_ARG_KEY_DESC,
@@ -50,6 +50,8 @@ from artemis.utils.notes import (
     save_note_content,
     update_note_content,
 )
+from third_party.mobile_use.tools.tool_wrapper import make_save_note_wrapper
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -147,7 +149,7 @@ class SaveNoteTool(ArtemisTool):
                 else "."
             )
             save_note_content(base_dir, k, c)
-            agent_outcome = f"Successfully saved note to {k}.md."
+            agent_outcome = f"Saved note '{k}'."
             status = "success"
         except Exception as e:  # pylint: disable=broad-exception-caught
             agent_outcome = f"Failed to save note {k}.md: {e}"
@@ -226,7 +228,7 @@ class AppendNoteTool(ArtemisTool):
                 else "."
             )
             append_note_content(base_dir, k, c)
-            agent_outcome = f"Successfully appended note to {k}.md."
+            agent_outcome = f"Appended to note '{k}'."
             status = "success"
         except Exception as e:  # pylint: disable=broad-exception-caught
             agent_outcome = f"Failed to append note {k}.md: {e}"
@@ -308,9 +310,9 @@ class UpdateNoteTool(ArtemisTool):
             )
             warning = update_note_content(base_dir, k, t, r)
             if warning:
-                agent_outcome = f"Successfully updated note '{k}'.\nWARNING: {warning}"
+                agent_outcome = f"Updated note '{k}'.\nWARNING: {warning}"
             else:
-                agent_outcome = f"Successfully updated note '{k}'."
+                agent_outcome = f"Updated note '{k}'."
             status = "success"
         except Exception as e:  # pylint: disable=broad-exception-caught
             agent_outcome = f"Failed to update note '{k}': {e}"
@@ -641,9 +643,9 @@ class SaveNotePureTool(ArtemisTool):
                 else "."
             )
             save_note_content(base_dir, k, c)
-            return f"Successfully saved note to {k}.md."
+            return f"Saved note '{k}'."
         except Exception as e:  # pylint: disable=broad-exception-caught
-            return f"Failed to save note {k}.md: {e}"
+            return ToolFailure(f"Failed to save note {k}.md: {e}")
 
 
 # Universal pure tool instance & aliases
@@ -708,10 +710,10 @@ class UpdateNotePureTool(ArtemisTool):
             )
             warning = update_note_content(base_dir, k, t, r)
             if warning:
-                return f"Successfully updated note '{k}'.\nWARNING: {warning}"
-            return f"Successfully updated note '{k}'."
+                return f"Updated note '{k}'.\nWARNING: {warning}"
+            return f"Updated note '{k}'."
         except Exception as e:  # pylint: disable=broad-exception-caught
-            return f"Failed to update note '{k}': {e}"
+            return ToolFailure(f"Failed to update note '{k}': {e}")
 
 
 # Universal pure tool instance & aliases
@@ -773,9 +775,9 @@ class AppendNotePureTool(ArtemisTool):
                 else "."
             )
             append_note_content(base_dir, k, c)
-            return f"Successfully appended note to {k}.md."
+            return f"Appended to note '{k}'."
         except Exception as e:  # pylint: disable=broad-exception-caught
-            return f"Failed to append note {k}.md: {e}"
+            return ToolFailure(f"Failed to append note {k}.md: {e}")
 
 
 # Universal pure tool instance & aliases
@@ -788,11 +790,7 @@ def get_append_note_tool_pure(ctx: ArtemisContext) -> BaseTool:
     return append_note_pure.to_langchain_tool(ctx, name="append_note")
 
 
-save_note_wrapper = ToolWrapper(
-    tool_fn_getter=get_save_note_tool,
-    on_success_fn=lambda key: f"Successfully saved note '{key}'.",
-    on_failure_fn=lambda key: f"Failed to save note '{key}'.",
-)
+save_note_wrapper = make_save_note_wrapper(get_save_note_tool)
 
 read_note_wrapper = ToolWrapper(
     tool_fn_getter=get_read_note_tool,
@@ -809,13 +807,13 @@ list_notes_wrapper = ToolWrapper(
 
 update_note_wrapper = ToolWrapper(
     tool_fn_getter=get_update_note_tool,
-    on_success_fn=lambda key: f"Successfully updated note '{key}'.",
+    on_success_fn=lambda key: f"Updated note '{key}'.",
     on_failure_fn=lambda key: f"Failed to update note '{key}'.",
 )
 
 
 append_note_wrapper = ToolWrapper(
     tool_fn_getter=get_append_note_tool,
-    on_success_fn=lambda key: f"Successfully appended note '{key}'.",
+    on_success_fn=lambda key: f"Appended to note '{key}'.",
     on_failure_fn=lambda key: f"Failed to append note '{key}'.",
 )

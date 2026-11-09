@@ -25,6 +25,7 @@ from pathlib import Path
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 
+from artemis.core.tool_failure import is_tool_failure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import TraceSpan, trace
 from artemis.memory.context_policy import build_history_for
@@ -39,9 +40,9 @@ from artemis.tools.tool_wrapper import (
     split_multimodal_result,
     tool_result_messages,
 )
-from artemis.utils.logger import get_logger
 from artemis.utils.notes import get_note_file_path
 from artemis.utils.task_tree import get_active_subgoal_hashes
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -161,7 +162,7 @@ class HistoryAnalyzer:
                                 tool=tool, args=args, tool_call_id=tc["id"]
                             )
                             text, _ = split_multimodal_result(result)
-                            status = "error" if text.startswith("Error") else "success"
+                            status = "error" if is_tool_failure(result) else "success"
                             span.result = text
                             if status == "error":
                                 span.status = "failed"

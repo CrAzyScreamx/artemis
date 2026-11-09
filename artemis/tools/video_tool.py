@@ -25,6 +25,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.agents.video_analyzer.video_analyzer import VideoAnalyzer
 from artemis.context import ArtemisContext
 from artemis.core.tool_declaration import ToolDeclaration
@@ -33,8 +34,8 @@ from artemis.drivers.base import BaseDeviceDriver
 from artemis.graph.state import State
 from artemis.tools.base import ArtemisTool, ToolCategory
 from artemis.tools.tool_wrapper import ToolWrapper
-from artemis.tools.types import CyFunctionDetector
-from artemis.utils.logger import get_logger
+from artemis.utils.cython_compat import CyFunctionDetector
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -62,7 +63,7 @@ class VideoAnalyzerArgs(BaseModel):
 
 OPERATOR_VIDEO_ANALYZER_DOCSTRING = (
     "[VIDEO] Use this tool to analyze any specific time range of the video"
-    " recording. This tool delegates to a powerful video-analyzing subagent"
+    " recording. This tool delegates to a video analysis subagent"
     " with full access to the continuous screen recording of your entire"
     " execution session.\n\n"
     "- This tool overcomes your limitation of only receiving discrete"
@@ -220,11 +221,11 @@ class VideoAnalyzerPureTool(ArtemisTool):
             agent = VideoAnalyzer(ctx)
             agent_outcome, status = await agent.run(time_desc, purp)
             if status == "failed":
-                return f"Video analysis failed: {agent_outcome}"
+                return ToolFailure(f"Video analysis failed: {agent_outcome}")
             return agent_outcome
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Error in pure video_analyzer tool: {e}")
-            return f"Error running video analyzer: {e}"
+            return ToolFailure(f"Error running video analyzer: {e}")
 
 
 # Universal pure tool instance & aliases

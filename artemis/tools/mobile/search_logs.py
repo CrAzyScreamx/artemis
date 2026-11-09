@@ -18,15 +18,39 @@ from typing import Any
 from langchain_core.tools.base import BaseTool
 from pydantic import BaseModel, Field
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import trace_langchain_tool
 from artemis.drivers.base import BaseDeviceDriver
 from artemis.graph.state import State
 from artemis.tools.base import ArtemisTool, ToolCategory
 from artemis.tools.mobile.log_utils import fetch_and_filter_logs
-from artemis.utils.logger import get_logger
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+#: How many line ranges a merged block's header lists before it is cut.
+_MAX_HEADER_RANGES = 8
+
+
+def _compress_line_numbers(indices: list[int]) -> str:
+    """Renders sorted line numbers as ranges: ``6``, ``69-79``, ``699-798``.
+
+    Consecutive runs collapse into ``start-end``; at most
+    ``_MAX_HEADER_RANGES`` ranges are listed, the rest replaced by ``...``.
+    """
+    runs: list[str] = []
+    start = prev = indices[0]
+    for idx in indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        runs.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = idx
+    runs.append(str(start) if start == prev else f"{start}-{prev}")
+    if len(runs) > _MAX_HEADER_RANGES:
+        return ", ".join(runs[:_MAX_HEADER_RANGES]) + ", ..."
+    return ", ".join(runs)
 
 
 # pylint: disable=too-many-branches,too-many-locals,too-many-statements
@@ -43,7 +67,7 @@ def search_and_merge_logs(
         try:
             pattern = re.compile(keyword, re.IGNORECASE)
         except re.error as e:
-            return f"Error: Invalid regex: {e}"
+            return ToolFailure(f"Error: Invalid regex: {e}")
     else:
         keyword_lower = keyword.lower()
 
@@ -98,7 +122,7 @@ def search_and_merge_logs(
             truncated = True
             break
 
-        match_str = ", ".join(map(str, match_indices))
+        match_str = _compress_line_numbers(match_indices)
         matches.append(f"--- Match at line(s) {match_str} ---")
         for idx in range(start, end):
             line_content = log_lines[idx]
@@ -222,7 +246,7 @@ class SearchLogsTool(ArtemisTool):
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Failed to search logs: {e}")
-            return f"Error searching logs: {e}"
+            return ToolFailure(f"Error searching logs: {e}")
 
 
 # Universal tool instance & aliases

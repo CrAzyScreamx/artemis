@@ -279,6 +279,7 @@ export function shouldShowTool(tool: any, _stepData?: any): boolean {
   if (!tool || !tool.name) return false;
   if (tool.type === 'llm_call') return false;
   if (tool.type === 'agent') return false;
+  if (tool.type === 'log') return false; // system notes render as quiet rows, not tool cards
   if (isInternalPlumbingTool(tool)) return false;
 
   return true;
@@ -725,21 +726,31 @@ export function getCompressionLabel(tool: any): string {
     : 'earlier steps';
   const rangeCapitalized = range.charAt(0).toUpperCase() + range.slice(1);
   const status = String(tool?.status || '').toLowerCase();
+  const phase = getCompressionPhase(tool);
 
-  if (status === 'failed') {
+  if (status === 'failed' || phase === 'failed') {
     return `Couldn't condense ${range} yet; keeping the full record and retrying later`;
   }
   if (status !== 'success') {
-    return String(args.note || '').toLowerCase() === 'retrying'
-      ? `Retrying the memory summary for ${range}…`
-      : `Condensing ${range} into a short memory to free up room…`;
+    const note = String(args.note || '').toLowerCase();
+    if (note === 'retrying') return `Retrying the memory summary for ${range}…`;
+    if (note === 'held' || phase === 'ready') {
+      const swapAt = Number(args.swap_at_tokens);
+      const heldContext = Number(args.context_tokens);
+      const heldParts = [`Short memory for ${range} is ready; keeping the full record until working memory fills up`];
+      if (heldContext > 0 && swapAt > 0) {
+        heldParts.push(`≈ ${formatTokenFigure(heldContext)} of ${formatTokenFigure(swapAt)} tokens`);
+      }
+      return heldParts.join(' · ');
+    }
+    return `Condensing ${range} into a short memory to free up room…`;
   }
 
   const parts: string[] = [];
   const source = Number(args.source_tokens);
   const summary = Number(args.summary_tokens);
   if (args.forced) {
-    parts.push(`${rangeCapitalized} replaced by a brief snapshot (memory was nearly full)`);
+    parts.push(`${rangeCapitalized} condensed into a recap to free up memory`);
   } else {
     parts.push(`${rangeCapitalized} condensed into a short memory`);
     if (source > 0 && summary > 0) {
@@ -756,6 +767,57 @@ export function getCompressionLabel(tool: any): string {
       : `working memory ≈ ${formatTokenFigure(context)} tokens`);
   }
   return parts.join(' · ');
+}
+
+/**
+ * Plain-language phases of one compress_history line. Mirrors
+ * COMPRESSION_PHASES in artemis/memory/chunking.py: the backend writes
+ * `args.phase`; the trace `status` (running/success/failed) is left alone.
+ */
+export type CompressionPhase = 'summarizing' | 'ready' | 'applied' | 'failed';
+
+const COMPRESSION_PHASES: readonly CompressionPhase[] = ['summarizing', 'ready', 'applied', 'failed'];
+
+export function isCompressionTool(tool: any): boolean {
+  const name = String(tool?.name || '').toLowerCase().replace(/^(_)?exec_/, '');
+  return name === 'compress_history';
+}
+
+/**
+ * Phase of a compress_history line. Prefers the backend's `args.phase`;
+ * older traces without it fall back to status + note (`held` ⇒ ready).
+ */
+export function getCompressionPhase(tool: any): CompressionPhase {
+  const args = getToolArgs(tool) || {};
+  const declared = String(args.phase || '').toLowerCase() as CompressionPhase;
+  if (COMPRESSION_PHASES.includes(declared)) return declared;
+  const status = String(tool?.status || '').toLowerCase();
+  if (status === 'failed') return 'failed';
+  if (status === 'success') return 'applied';
+  if (String(args.note || '').toLowerCase() === 'held') return 'ready';
+  return 'summarizing';
+}
+
+/** One short, non-technical label per compression phase. */
+export function getCompressionPhaseLabel(tool: any): string {
+  switch (getCompressionPhase(tool)) {
+    case 'ready':
+      return 'Summary ready; kept in reserve until the context fills up';
+    case 'applied':
+      return 'Replaced this stretch with its summary';
+    case 'failed':
+      return 'Summary failed; full record kept';
+    default:
+      return 'Summarizing this stretch';
+  }
+}
+
+/**
+ * A ready-but-held summary is waiting, not working: the card must not keep
+ * its running pulse even though the trace status is still `running`.
+ */
+export function isCompressionWaiting(tool: any): boolean {
+  return isCompressionTool(tool) && getCompressionPhase(tool) === 'ready';
 }
 
 /**
@@ -912,6 +974,19 @@ export function getToolTitle(tool: any): string {
 }
 
 /**
+ * Join per-point self-described targets (click_sequence `target_descriptions`)
+ * into one label, chained with ' → ' like the coordinate rendering.
+ * Returns '' when the value is missing or holds no usable text.
+ */
+export function joinTargetDescriptions(descriptions: any): string {
+  if (!Array.isArray(descriptions)) return '';
+  const parts = descriptions
+    .map(d => (d === null || d === undefined) ? '' : String(d).trim())
+    .filter(d => d.length > 0);
+  return parts.join(' → ');
+}
+
+/**
  * Get target text description for tools
  */
 export function getToolTargetText(tool: any): string {
@@ -950,6 +1025,11 @@ export function getToolTargetText(tool: any): string {
   if (name === 'report_failure_analysis') {
     return args.status || args.reason || args.analysis || '';
   }
+  if (name === 'click_sequence' || name === 'tap_sequence') {
+    // One self-described target per point, chained like getToolCoords does.
+    const joined = joinTargetDescriptions(args.target_descriptions);
+    if (joined) return joined;
+  }
   if (args.target && typeof args.target === 'string') {
     return args.target;
   }
@@ -959,7 +1039,7 @@ export function getToolTargetText(tool: any): string {
   if (args.index !== undefined) {
     return `Element #${args.index}`;
   }
-  return args.target_text || args.target_class || args.element || args.element_text || (name !== 'input_text' ? args.text : '') || '';
+  return args.target_text || args.target_description || args.target_class || args.element || args.element_text || (name !== 'input_text' ? args.text : '') || '';
 }
 
 /**
@@ -1162,7 +1242,8 @@ export function extractToolExtraParams(toolData: any, cache?: WeakMap<any, Actio
   }
 
   const standardKeys = new Set([
-    'action', 'name', 'type', 'target_text', 'text', 'input_text', 'target',
+    'action', 'name', 'type', 'target_text', 'target_description', 'target_descriptions',
+    'text', 'input_text', 'target',
     'coordinates', 'coords', 'target_bounds', 'bounds', 'target_resource_id',
     'resource_id', 'target_class', 'class_name', 'normalized_coordinates',
     'pre_image_name', 'post_image_name', 'pre_screenshot', 'post_screenshot',

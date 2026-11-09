@@ -17,13 +17,14 @@ from typing import Any
 from langchain_core.tools.base import BaseTool
 from pydantic import BaseModel, Field
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import trace_langchain_tool
 from artemis.drivers.base import BaseDeviceDriver
 from artemis.graph.state import State
 from artemis.tools.base import ArtemisTool, ToolCategory
 from artemis.tools.mobile.log_utils import fetch_and_filter_logs
-from artemis.utils.logger import get_logger
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -101,7 +102,7 @@ class ReadLogsTool(ArtemisTool):
             return logs
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Failed to read logs: {e}")
-            return f"Failed to read logs: {e}"
+            return ToolFailure(f"Failed to read logs: {e}")
 
 
 # Universal tool instance & aliases

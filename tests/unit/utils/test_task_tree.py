@@ -48,7 +48,7 @@ def test_build_plan_and_history_separated_layout():
     assert "--- Execution History ---" in output
     assert "- **Step 1 (Most Recent Step, Start: 2.5s)**" in output
     assert "    - Thought 1" in output
-    assert "  * [Planned Action]: Launched app 'None'" in output
+    assert "  * [Action]: Launched app 'None'" in output
 
 
 def test_build_plan_and_history_granularities():
@@ -298,7 +298,7 @@ def test_build_plan_and_history_with_tool_calls():
     ]
     output = build_plan_and_history(plan, steps, "default", last_n_detailed=1)
 
-    assert "* [Operator Decision Loop]:" in output
+    assert "* [Reasoning & tool calls]:" in output
     assert '`read_note({"key": "other_note"})` -> - [ ] Milestone' in output
 
 
@@ -339,7 +339,7 @@ def test_build_plan_and_history_with_interleaved_events():
     assert '    - [Tool Call]: `read_note({"file": "notes.txt"})` -> Milestone plan' in output
 
     # It should use the new section header
-    assert "* [Operator Decision Loop]:" in output
+    assert "* [Reasoning & tool calls]:" in output
 
 
 def test_build_plan_and_history_concatenates_thoughts():
@@ -396,14 +396,14 @@ def test_build_plan_and_history_interleaved_decision_loop():
     assert plan in output
     assert "--- Execution History ---" in output
     assert "- **Step 1 (Most Recent Step, Start: 2.5s)**" in output
-    assert "* [Operator Decision Loop]:" in output
+    assert "* [Reasoning & tool calls]:" in output
     assert "    - I should find search icon." in output
     assert (
         '- [Tool Call]: `ask_explorer({"query": "search icon"})` -> {"center":'
         " [500, 600]}" in output
     )
     assert "    - Clicking coordinates [500, 600] now." in output
-    assert "* [Planned Action]: Tapped 'Search' at None" in output
+    assert "* [Action]: Tapped 'Search' at None" in output
     assert "* [Validator Execution Result]" not in output
 
 
@@ -460,12 +460,9 @@ def test_build_plan_and_history_safety_net_and_incident():
     output = build_plan_and_history(plan, steps, "default", last_n_detailed=1)
 
     assert "- **Step 1 (Most Recent Step, Start: 5.0s)**" in output
-    assert "* [Operator Decision Loop]:" in output
+    assert "* [Reasoning & tool calls]:" in output
     assert "    - Let's click search." in output
-    assert (
-        "* [Planned Action]: Tapped 'Search' at None (Intercepted by"
-        " Pre-Execution Safety Net)" in output
-    )
+    assert "* [Action]: Tapped 'Search' at None (Intercepted by Pre-Execution Safety Net)" in output
     assert "* [Pre-Execution Safety Net]:" in output
     assert (
         "- [Safety Net Check]: (Intercepted by Pre-Execution Safety Net: Target button is"
@@ -475,7 +472,7 @@ def test_build_plan_and_history_safety_net_and_incident():
     assert "Failure Analyzer" not in output
     assert (
         "* [Result]: Error: Intercepted by Pre-Execution Safety Net"
-        " (target_disappeared, consecutive failure #2) on action `Tapped 'Search' at"
+        " (target_disappeared, consecutive failure #2) on action `tap 'Search' at"
         " None`: Target button is not visible" in output
     )
 
@@ -528,16 +525,14 @@ def test_build_plan_and_history_fast_action_burst():
     ]
     # Detailed view: every member with its outcome.
     output = build_plan_and_history(plan, steps, "default", last_n_detailed=1)
-    assert (
-        "* [Planned Fast-Action Burst]: 3 actions fired back to back without the"
-        " safety net" in output
-    )
-    assert "    1. Tapped element at [500, 900] (executed)" in output
+    assert "* [Fast-Action Burst]: 3 actions fired back to back without the safety net" in output
+    assert "    1. Tapped element at [500, 900] (dispatched)" in output
     assert "    2. Tapped 'Skip' at [880, 120] (FAILED: Error: tap rejected)" in output
     assert "    3. Pressed key 'BACK' (skipped)" in output
+    # The failed member is quoted in intent form: it did not happen.
     assert (
         "* [Result]: Error: Execution failed (general, consecutive failure #1) on burst"
-        " action 2/3 `Tapped 'Skip' at [880, 120]`: Error: tap rejected; the remaining"
+        " action 2/3 `tap 'Skip' at [880, 120]`: Error: tap rejected; the remaining"
         " burst actions were not executed" in output
     )
 
@@ -662,7 +657,7 @@ def test_render_step_replay_shows_summary_thoughts_and_full_tool_results():
     assert "`ask_explorer(" in out
     assert long_result in out
     # Action tools are the planned action, not a tool-call line.
-    assert "[Planned Action]: Tapped 'Save' at [0.5, 0.5]" in out
+    assert "[Action]: Tapped 'Save' at [0.5, 0.5]" in out
     assert "`click(" not in out
 
 
@@ -715,6 +710,174 @@ def test_render_step_replay_shows_described_images_in_tool_results():
     assert "[screenshot: pre-action of Step 1]" in out
 
 
+def test_render_step_replay_header_uses_the_session_clock():
+    """The replay header carries the same ``T+mm:ss`` offset the prompts and
+    ``search_history`` use; the legacy ``Start:`` text only remains when no
+    session clock / step timestamp exists."""
+    from artemis.utils.task_tree import render_step_replay, replay_time_label
+
+    step = _replay_step("ok", timestamp=1000.0 + 61.0)
+    out = render_step_replay(step, session_start=1000.0)
+    assert "- **Step 4 (T+01:01)**" in out
+    assert "Start:" not in out
+
+    # No session start (or a non-numeric one, e.g. a mocked reader): fallback.
+    assert "- **Step 4 (Start: 12.0s)**" in render_step_replay(step)
+    assert "- **Step 4 (Start: 12.0s)**" in render_step_replay(step, session_start=object())
+    # A step without a timestamp cannot be placed on the session clock.
+    assert replay_time_label(_replay_step("ok"), 1000.0) == "Start: 12.0s"
+
+
+def test_render_step_replay_labels_are_role_neutral():
+    """Flash has no Operator, so the block labels name what they hold."""
+    from artemis.utils.task_tree import render_step_replay
+
+    out = render_step_replay(_replay_step("ok"))
+    assert "  * [Reasoning & tool calls]:" in out
+    assert "  * [Action]: Tapped 'Save' at [0.5, 0.5]" in out
+    assert "Operator Decision Loop" not in out
+    assert "Planned Action" not in out
+
+
+def test_render_step_replay_prints_a_failure_once():
+    """A failed step shows its error on the [Result] line only, not appended
+    to the action line as well."""
+    from artemis.utils.task_tree import render_step_replay
+
+    out = render_step_replay(
+        _replay_step(
+            "ok",
+            last_execution_result={
+                "status": "failed",
+                "execution": [{"action": "click", "attempts": ["Error: tap rejected"]}],
+            },
+        )
+    )
+    assert "  * [Action]: Tapped 'Save' at [0.5, 0.5]\n" in out
+    assert "  * [Result]: Error: tap rejected" in out
+    assert out.count("tap rejected") == 1
+    assert "Execution failed:" not in out
+
+
+def test_render_step_replay_indents_multiline_reasoning():
+    from artemis.utils.task_tree import render_step_replay
+
+    step = _replay_step(
+        "ok",
+        interleaved_events=[
+            {"type": "thought", "content": "- Save findings first.\nTap Wi-Fi.\nThen verify."}
+        ],
+    )
+    out = render_step_replay(step)
+    assert "\n    - - Save findings first.\n      Tap Wi-Fi.\n      Then verify." in out
+
+
+def test_format_action_clean_directional_swipe_shows_direction_first():
+    """``swipe(direction="up")`` replays as the direction the agent issued; the
+    recorded path is a parenthesised detail (Flash records both)."""
+    from artemis.utils.task_tree import format_action_clean
+
+    flash_record = {
+        "action": "swipe",
+        "coordinates": [600, 700, 600, 300],
+        "coordinate_space": "normalized",
+        "normalized_start_coordinates": [600, 700],
+        "normalized_end_coordinates": [600, 300],
+        "args": {"direction": "up", "duration": 800},
+    }
+    assert (
+        format_action_clean(flash_record) == "Swiped up (from [600, 700] to [600, 300]) over 800ms"
+    )
+    assert format_action_clean({"action": "swipe", "direction": "down"}) == "Swiped down"
+    assert (
+        format_action_clean(
+            {
+                "action": "swipe",
+                "gesture": "left",
+                "start_coordinates": [750, 500],
+                "end_coordinates": [250, 500],
+            }
+        )
+        == "Swiped left (from [750, 500] to [250, 500])"
+    )
+    # Without a direction the path is the headline, as before.
+    assert (
+        format_action_clean({"action": "swipe", "coordinates": [600, 700, 600, 300]})
+        == "Swiped from [600, 700] to [600, 300]"
+    )
+
+
+def test_action_intent_phrase_and_incident_line_use_intent_form():
+    """Failure contexts describe what the agent tried to do, not an outcome."""
+    from artemis.utils.task_tree import (
+        action_intent_phrase,
+        format_action_intent,
+        format_incident_clean,
+    )
+
+    assert format_action_intent({"action": "launch_app", "app_name": "NonexistentApp"}) == (
+        "launch app 'NonexistentApp'"
+    )
+    assert (
+        format_action_intent(
+            {"action": "click", "coordinates": [500, 520], "target_description": "Wi-Fi row"}
+        )
+        == "tap 'Wi-Fi row' (self-described) at [500, 520]"
+    )
+    assert format_action_intent({"action": "swipe", "direction": "up"}) == "swipe up"
+    assert (
+        format_action_intent(
+            {
+                "action": "input_text",
+                "text": "hello",
+                "target_text": "Search",
+                "coordinates": [1, 2],
+            }
+        )
+        == "type 'hello' into 'Search' at [1, 2]"
+    )
+    assert format_action_intent({"action": "press_key", "keycode": "BACK"}) == "press key 'BACK'"
+    assert format_action_intent({"action": "wait_for_delay", "delay_ms": 200}) == "wait 200ms"
+    assert format_action_intent({"action": "long_press", "coordinates": [1, 2]}) == (
+        "long press element at [1, 2]"
+    )
+    assert format_action_intent({"action": "click", "coordinates": [1, 2], "times": 2}) == (
+        "double tap element at [1, 2]"
+    )
+    # Unknown phrases pass through untouched.
+    assert action_intent_phrase("Fast-action burst (2 actions, unvetted): x") == (
+        "Fast-action burst (2 actions, unvetted): x"
+    )
+    assert action_intent_phrase("") == ""
+
+    line = format_incident_clean(
+        {
+            "kind": "exec_error",
+            "category": "general",
+            "consecutive_failures": 2,
+            "action": {"action": "launch_app", "app_name": "NonexistentApp"},
+            "action_description": "Launched app 'NonexistentApp'",
+            "reason": "Error finding package for app: NonexistentApp",
+        }
+    )
+    assert line == (
+        "Error: Execution failed (general, consecutive failure #2) on action"
+        " `launch app 'NonexistentApp'`: Error finding package for app: NonexistentApp"
+    )
+    intercepted = format_incident_clean(
+        {
+            "kind": "safety_net",
+            "category": "target_disappeared",
+            "action": {"action": "click", "target_text": "Skip", "coordinates": [880, 120]},
+            "reason": "Target element 'Skip' was not found on the screen.",
+        }
+    )
+    assert intercepted.startswith(
+        "Error: Intercepted by Pre-Execution Safety Net (target_disappeared, consecutive"
+        " failure #1) on action `tap 'Skip' at [880, 120]`:"
+    )
+
+
 def test_format_action_clean_reads_flash_arguments_and_maps_manage_app():
     """Read Flash action arguments from ``args`` when formatting app launches."""
     from artemis.utils.task_tree import format_action_clean
@@ -750,4 +913,89 @@ def test_format_action_clean_reads_flash_arguments_and_maps_manage_app():
             }
         )
         == "Tapped 'Save' at [1, 2]"
+    )
+
+
+def test_format_action_clean_marks_self_described_coordinate_targets():
+    """A coordinate target's label is the model's own description, and every
+    later reader sees it marked as such; an index target's observed element
+    text carries no marker."""
+    from artemis.utils.task_tree import SELF_DESCRIBED_MARKER, format_action_clean
+
+    assert SELF_DESCRIBED_MARKER == "(self-described)"
+    assert (
+        format_action_clean(
+            {"action": "tap", "coordinates": [540, 1440], "target_description": "play button"}
+        )
+        == "Tapped 'play button' (self-described) at [540, 1440]"
+    )
+    # Observed text outranks the description when both are present, unmarked.
+    assert (
+        format_action_clean(
+            {
+                "action": "tap",
+                "coordinates": [1, 2],
+                "target_text": "Play",
+                "target_description": "play button",
+            }
+        )
+        == "Tapped 'Play' at [1, 2]"
+    )
+    assert (
+        format_action_clean(
+            {
+                "action": "long_press_on",
+                "coordinates": [1, 2],
+                "duration": 1500,
+                "target_description": "app icon",
+            }
+        )
+        == "Long pressed 'app icon' (self-described) at [1, 2] for 1500ms"
+    )
+    assert (
+        format_action_clean(
+            {
+                "action": "focus_and_input_text",
+                "coordinates": [3, 4],
+                "text": "hello",
+                "target_description": "search box",
+            }
+        )
+        == "Inputted 'hello' into 'search box' (self-described) at [3, 4]"
+    )
+    assert (
+        format_action_clean(
+            {
+                "action": "swipe",
+                "coordinates": [100, 500, 900, 500],
+                "duration": 800,
+                "target_description": "brightness knob",
+            }
+        )
+        == "Swiped 'brightness knob' (self-described) from [100, 500] to [900, 500] over 800ms"
+    )
+    # Flash keeps the description under ``args``; it is read from there too.
+    assert (
+        format_action_clean(
+            {
+                "action": "click",
+                "coordinates": [320, 399],
+                "args": {"target": [320, 399], "target_description": "skip ad"},
+            }
+        )
+        == "Tapped 'skip ad' (self-described) at [320, 399]"
+    )
+    assert format_action_clean(
+        {
+            "action": "click_sequence",
+            "coordinates": [[500, 280], [885, 362]],
+            "target_descriptions": ["video body", "skip button"],
+        }
+    ) == (
+        "Tapped sequence of targets: 'video body' (self-described) at [500, 280],"
+        " 'skip button' (self-described) at [885, 362]"
+    )
+    # Unnamed targets stay unnamed: no marker without a description.
+    assert format_action_clean({"action": "tap", "coordinates": [1, 2]}) == (
+        "Tapped element at [1, 2]"
     )

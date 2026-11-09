@@ -1,10 +1,16 @@
 import {
   cleanErrorMessage,
+  extractToolExtraParams,
   getCompressionLabel,
+  getCompressionPhase,
+  getCompressionPhaseLabel,
+  isCompressionWaiting,
   getToolDisplayLabel,
   getToolIcon,
+  getToolTargetText,
   getUniqueGenericTools,
   getVideoAnalysisView,
+  joinTargetDescriptions,
   shouldShowTool
 } from './tool-formatter.util';
 
@@ -32,6 +38,22 @@ describe('compress_history timeline line', () => {
       .toBe('Condensing step 5 into a short memory to free up room…');
   });
 
+  it('says the summary is ready but held while working memory is still small', () => {
+    const held = trace('running', {
+      start_step: 1,
+      end_step: 4,
+      note: 'held',
+      context_tokens: 20000,
+      context_budget: 80000,
+      swap_at_tokens: 28000
+    });
+    expect(getCompressionLabel(held)).toBe(
+      'Short memory for steps 1–4 is ready; keeping the full record until working memory fills up · ≈ 20k of 28k tokens'
+    );
+    expect(getCompressionLabel(trace('running', { start_step: 1, end_step: 4, note: 'held' })))
+      .toBe('Short memory for steps 1–4 is ready; keeping the full record until working memory fills up');
+  });
+
   it('reports the size reduction and the working memory once done', () => {
     const done = trace('success', {
       start_step: 12,
@@ -51,12 +73,52 @@ describe('compress_history timeline line', () => {
     expect(getCompressionLabel(done)).toBe('Steps 1–4 condensed into a short memory · 3k → 1.5k tokens (2× smaller)');
   });
 
-  it('explains a forced snapshot and a failed attempt in plain words', () => {
+  it('explains a forced recap and a failed attempt in plain words', () => {
     const forced = trace('success', { start_step: 1, end_step: 4, forced: true, context_tokens: 70000, context_budget: 80000 });
     expect(getCompressionLabel(forced))
-      .toBe('Steps 1–4 replaced by a brief snapshot (memory was nearly full) · working memory ≈ 70k of 80k tokens');
+      .toBe('Steps 1–4 condensed into a recap to free up memory · working memory ≈ 70k of 80k tokens');
     expect(getCompressionLabel(trace('failed', { start_step: 1, end_step: 4 })))
       .toBe("Couldn't condense steps 1–4 yet; keeping the full record and retrying later");
+  });
+
+  describe('phase (args.phase from the backend)', () => {
+    it('reads the declared phase and maps it to one short plain-language label', () => {
+      const cases: Array<[string, string, string]> = [
+        ['running', 'summarizing', 'Summarizing this stretch'],
+        ['running', 'ready', 'Summary ready; kept in reserve until the context fills up'],
+        ['success', 'applied', 'Replaced this stretch with its summary'],
+        ['failed', 'failed', 'Summary failed; full record kept']
+      ];
+      for (const [status, phase, label] of cases) {
+        const tool = trace(status, { start_step: 1, end_step: 4, phase });
+        expect(getCompressionPhase(tool)).toBe(phase as any);
+        expect(getCompressionPhaseLabel(tool)).toBe(label);
+      }
+    });
+
+    it('falls back to status and note on traces that carry no phase', () => {
+      expect(getCompressionPhase(trace('running', { start_step: 1, end_step: 4 }))).toBe('summarizing');
+      expect(getCompressionPhase(trace('running', { start_step: 1, end_step: 4, note: 'retrying' }))).toBe('summarizing');
+      expect(getCompressionPhase(trace('running', { start_step: 1, end_step: 4, note: 'held' }))).toBe('ready');
+      expect(getCompressionPhase(trace('success', { start_step: 1, end_step: 4 }))).toBe('applied');
+      expect(getCompressionPhase(trace('failed', { start_step: 1, end_step: 4 }))).toBe('failed');
+      expect(getCompressionPhase(trace('running', { start_step: 1, end_step: 4, phase: 'bogus' }))).toBe('summarizing');
+    });
+
+    it('drives the timeline line from the phase even without a note', () => {
+      expect(getCompressionLabel(trace('running', { start_step: 1, end_step: 4, phase: 'ready' })))
+        .toBe('Short memory for steps 1–4 is ready; keeping the full record until working memory fills up');
+      expect(getCompressionLabel(trace('running', { start_step: 1, end_step: 4, phase: 'summarizing' })))
+        .toBe('Condensing steps 1–4 into a short memory to free up room…');
+    });
+
+    it('treats a ready-but-held summary as waiting, not running', () => {
+      expect(isCompressionWaiting(trace('running', { start_step: 1, end_step: 4, phase: 'ready' }))).toBeTrue();
+      expect(isCompressionWaiting(trace('running', { start_step: 1, end_step: 4, note: 'held' }))).toBeTrue();
+      expect(isCompressionWaiting(trace('running', { start_step: 1, end_step: 4, phase: 'summarizing' }))).toBeFalse();
+      expect(isCompressionWaiting(trace('success', { start_step: 1, end_step: 4, phase: 'applied' }))).toBeFalse();
+      expect(isCompressionWaiting({ type: 'tool', name: 'save_note', status: 'running', payload: { args: { phase: 'ready' } } })).toBeFalse();
+    });
   });
 });
 
@@ -253,5 +315,61 @@ describe('shouldShowTool (Option A Single Source of Truth)', () => {
       type: 'tool'
     };
     expect(shouldShowTool(plumbingTool)).toBeFalse();
+  });
+});
+
+describe('getToolTargetText self-described targets', () => {
+  it('uses target_description for coordinate tools when no target_text is observed', () => {
+    expect(getToolTargetText({
+      name: 'click',
+      payload: { args: { coordinates: [500, 900], target_description: 'play button' } }
+    })).toBe('play button');
+    expect(getToolTargetText({
+      name: 'exec_long_press',
+      args: { coordinates: [500, 900], target_description: 'song row' }
+    })).toBe('song row');
+  });
+
+  it('prefers observed target_text over target_description', () => {
+    expect(getToolTargetText({
+      name: 'click',
+      payload: { args: { target_text: 'Play', target_description: 'play button' } }
+    })).toBe('Play');
+  });
+
+  it('chains click_sequence target_descriptions with the coordinate arrow', () => {
+    expect(getToolTargetText({
+      name: 'click_sequence',
+      payload: { args: { sequence: [[500, 300], [876, 360]], target_descriptions: ['play button', 'close ×'] } }
+    })).toBe('play button → close ×');
+  });
+
+  it('falls back gracefully when click_sequence descriptions are missing or short', () => {
+    expect(getToolTargetText({
+      name: 'click_sequence',
+      payload: { args: { sequence: [[500, 300], [876, 360]] } }
+    })).toBe('');
+    expect(getToolTargetText({
+      name: 'click_sequence',
+      payload: { args: { sequence: [[500, 300], [876, 360]], target_descriptions: ['play button'] } }
+    })).toBe('play button');
+    expect(getToolTargetText({
+      name: 'click_sequence',
+      payload: { args: { sequence: [[500, 300]], target_descriptions: [null, ''], target_description: 'fallback' } }
+    })).toBe('fallback');
+    expect(joinTargetDescriptions(undefined)).toBe('');
+    expect(joinTargetDescriptions('play button')).toBe('');
+  });
+});
+
+describe('extractToolExtraParams', () => {
+  it('hides target_description and target_descriptions from the extra parameter list', () => {
+    const keys = extractToolExtraParams({
+      name: 'click_sequence',
+      args: { sequence: [[1, 2]], target_descriptions: ['a'], target_description: 'b', interval_ms: 50 }
+    }).map(p => p.key);
+    expect(keys).not.toContain('Target Descriptions');
+    expect(keys).not.toContain('Target Description');
+    expect(keys).toContain('Interval Ms');
   });
 });

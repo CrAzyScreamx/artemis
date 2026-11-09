@@ -392,7 +392,7 @@ def _foreground_engine(tmp_path):
 
 
 def test_record_step_persists_explicit_foreground_app(tmp_path):
-    """M5: the historically dropped foreground_app parameter is persisted."""
+    """The foreground_app parameter is persisted."""
     engine = _foreground_engine(tmp_path)
     engine.record_step(
         foreground_app="com.android.settings",
@@ -615,7 +615,7 @@ def test_pro_pixel_record_is_normalized_exactly_once(tmp_path):
         action_taken=[action],
         last_execution_result={
             "status": "success",
-            "execution": [dict(action, attempts=["Success"])],
+            "execution": [dict(action, attempts=["Dispatched"])],
         },
         extra_metadata={"width": 1080, "height": 2400},
     )

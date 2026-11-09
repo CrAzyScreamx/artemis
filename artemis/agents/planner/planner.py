@@ -43,8 +43,6 @@ from artemis.tools.tool_wrapper import (
     get_tool_result_content,
     invoke_tool_with_injection,
 )
-from artemis.utils.decorators import wrap_with_callbacks
-from artemis.utils.logger import get_logger
 from artemis.utils.notes import get_note_file_path
 from artemis.utils.plan_grammar import (
     CHECKBOX_LINE_RE,
@@ -53,6 +51,9 @@ from artemis.utils.plan_grammar import (
     render_plan_grammar_spec,
 )
 from artemis.memory.context_policy import build_history_for
+from artemis.utils.cython_compat import CyFunctionDetector
+from third_party.mobile_use.utils.decorators import agent_lifecycle_logging
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -82,11 +83,19 @@ def validate_plan_format(content: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _checks_enabled(ctx: ArtemisContext) -> bool:
-    """Config-driven prompt assembly gate: with both check gates disabled, no
-    check-related instruction reaches any planner prompt."""
+def _check_gates(ctx: ArtemisContext) -> tuple[bool, bool]:
+    """(midway_checks, final_check): the two check gates, read separately so
+    the planner is taught the judgment moment that actually applies. With both
+    disabled, no check-related instruction reaches any planner prompt."""
     setup = getattr(ctx, "execution_setup", None)
-    return bool(setup and getattr(setup, "checks_enabled", False))
+    midway = bool(setup and getattr(setup, "midway_checks_enabled", False))
+    final = bool(setup and getattr(setup, "final_check_enabled", False))
+    return midway, final
+
+
+def _checks_enabled(ctx: ArtemisContext) -> bool:
+    """Config-driven prompt assembly gate (either check gate active)."""
+    return any(_check_gates(ctx))
 
 
 def build_planner_system_blocks(prompts_data: dict, mode: str, include_checks: bool) -> list[str]:
@@ -98,24 +107,6 @@ def build_planner_system_blocks(prompts_data: dict, mode: str, include_checks: b
         if extra in prompts_data.get("blocks", {}):
             blocks.append(extra)
     return blocks
-
-
-class _CyFunctionDetectorMeta(type):
-    def __instancecheck__(self, instance):
-        name = type(instance).__name__
-        return (
-            name
-            in (
-                "cyfunction",
-                "cython_function_or_method",
-                "builtin_function_or_method",
-            )
-            or "cyfunction" in name.lower()
-        )
-
-
-class CyFunctionDetector(metaclass=_CyFunctionDetectorMeta):
-    pass
 
 
 class ValidationResult(BaseModel):
@@ -152,12 +143,15 @@ async def run_async_planner_validation(
         with open(prompts_path, encoding="utf-8") as f:
             prompts_data = json.load(f)
 
-        include_checks = _checks_enabled(ctx)
+        midway, final = _check_gates(ctx)
+        include_checks = midway or final
         mode_config = prompts_data["modes"]["validator"]
         system_blocks = build_planner_system_blocks(prompts_data, "validator", include_checks)
         system_content = "\n\n".join(prompts_data["blocks"][block] for block in system_blocks)
         system_message = Template(system_content).render(
-            plan_grammar=render_plan_grammar_spec(include_checks)
+            plan_grammar=render_plan_grammar_spec(midway=midway, final=final),
+            midway_checks=midway,
+            final_check=final,
         )
 
         history_str = "No history available."
@@ -213,11 +207,7 @@ class PlannerNode:
         self.ctx = ctx
         self.tools = tools or []
 
-    @wrap_with_callbacks(
-        before=lambda: logger.info("Starting Planner Agent..."),
-        on_success=lambda _: logger.success("Planner Agent"),
-        on_failure=lambda _: logger.error("Planner Agent"),
-    )
+    @agent_lifecycle_logging("Planner", logger)
     @trace(type="agent", name="planner")
     async def __call__(self, state: State):
         state = strict_state(state, "planner")
@@ -228,15 +218,19 @@ class PlannerNode:
         mode = "initial_plan"
         mode_config = prompts_data["modes"][mode]
 
-        include_checks = _checks_enabled(self.ctx)
+        midway, final = _check_gates(self.ctx)
+        include_checks = midway or final
         # Assembly point (not in-template conditionals): check-generation
         # instructions only mount while the checking feature is active, so a
         # fully-disabled configuration yields a byte-identical planner prompt.
+        # Inside the mounted block, the judgment moment is worded per gate.
         system_blocks = build_planner_system_blocks(prompts_data, mode, include_checks)
         system_content = "\n\n".join(prompts_data["blocks"][block] for block in system_blocks)
 
         system_message = Template(system_content).render(
-            plan_grammar=render_plan_grammar_spec(include_checks)
+            plan_grammar=render_plan_grammar_spec(midway=midway, final=final),
+            midway_checks=midway,
+            final_check=final,
         )
 
         # Get screenshot

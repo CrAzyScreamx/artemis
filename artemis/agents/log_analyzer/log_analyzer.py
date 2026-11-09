@@ -19,24 +19,7 @@ from typing import Annotated, Any
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
-
-
-class _CyFunctionDetectorMeta(type):
-    def __instancecheck__(self, instance):
-        name = type(instance).__name__
-        return (
-            name
-            in (
-                "cyfunction",
-                "cython_function_or_method",
-                "builtin_function_or_method",
-            )
-            or "cyfunction" in name.lower()
-        )
-
-
-class CyFunctionDetector(metaclass=_CyFunctionDetectorMeta):
-    pass
+from artemis.utils.cython_compat import CyFunctionDetector
 
 
 class SpawnLogReaderArgs(BaseModel):
@@ -51,6 +34,7 @@ class SpawnLogReaderArgs(BaseModel):
 
 from langgraph.prebuilt import InjectedState
 
+from artemis.core.tool_failure import ToolFailure, is_tool_failure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import (
     CURRENT_TRACE_ID,
@@ -70,7 +54,7 @@ from artemis.tools.tool_wrapper import (
     get_tool_result_content,
     invoke_tool_with_injection,
 )
-from artemis.utils.logger import get_logger
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -102,7 +86,7 @@ class LogAnalyzerNode:
                     return self._raw_log_cache[cache_key]
 
                 result = await original_coroutine(**kwargs)
-                if isinstance(result, str) and not result.startswith("Failed to read logs"):
+                if isinstance(result, str) and not is_tool_failure(result):
                     self._raw_log_cache[cache_key] = result
                 return result
 
@@ -130,7 +114,7 @@ class LogAnalyzerNode:
                         )
                     except Exception as e:
                         logger.error(f"Failed to search logs locally: {e}")
-                        return f"Error searching logs: {e}"
+                        return ToolFailure(f"Error searching logs: {e}")
 
                 # If not cached, fetch them once via read_logs (or the original tool, which will fetch them)
                 # Note: search_logs itself fetches and filters. We can let the original_coroutine run,
@@ -161,7 +145,7 @@ class LogAnalyzerNode:
                     )
                 except Exception as e:
                     logger.error(f"Failed to fetch and search logs: {e}")
-                    return f"Error searching logs: {e}"
+                    return ToolFailure(f"Error searching logs: {e}")
 
             # Fallback to standard tool caching for other tools
             serialized_args = json.dumps(kwargs, sort_keys=True)
@@ -276,7 +260,7 @@ class LogAnalyzerNode:
                                 elif not isinstance(result, str):
                                     result = str(result)
                                 span.result = result
-                                if result.startswith("Error"):
+                                if is_tool_failure(result_obj):
                                     status = "error"
                                     span.status = "failed"
                                     span.error = result

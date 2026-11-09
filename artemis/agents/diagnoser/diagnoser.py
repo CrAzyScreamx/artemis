@@ -22,6 +22,7 @@ import uuid
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from artemis.core.tool_failure import is_tool_failure
 from artemis.context import ArtemisContext
 from artemis.data_engine.trace import (
     CURRENT_TRACE_ID,
@@ -30,6 +31,7 @@ from artemis.data_engine.trace import (
     trace_langchain_tool,
 )
 from artemis.graph.state import State
+from artemis.llm.google import usage_from_message
 from artemis.services.llm import acomplete, get_llm, invoke_llm_with_timeout_message
 from artemis.tools.command_tool import get_run_short_adb_command_tool
 from artemis.tools.diagnoser_submit_answer_tool import get_submit_answer_tool
@@ -46,12 +48,12 @@ from artemis.tools.tool_wrapper import (
 )
 from artemis.tools.video_tool import get_video_analyzer_tool
 from artemis.tools.wait_tool import get_wait_tool
-from artemis.utils.logger import get_logger
 from artemis.memory.context_policy import build_history_for
 from artemis.utils.task_tree import (
     get_active_subgoal_hashes,
     get_recent_subgoal_hashes,
 )
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -304,24 +306,8 @@ class Diagnoser:
         return base_llm.bind_tools(tools=traced_tools)
 
     def _token_usage_payload(self, response) -> dict | None:
-        """Extracts token-usage counters from the response metadata, if present."""
-        if not hasattr(response, "usage_metadata") or response.usage_metadata is None:
-            return None
-        usage = response.usage_metadata
-        if isinstance(usage, dict):
-            prompt_token_count = usage.get("prompt_token_count")
-            candidates_token_count = usage.get("candidates_token_count")
-            cached_content_token_count = usage.get("cached_content_token_count")
-        else:
-            prompt_token_count = getattr(usage, "prompt_token_count", None)
-            candidates_token_count = getattr(usage, "candidates_token_count", None)
-            cached_content_token_count = getattr(usage, "cached_content_token_count", None)
-
-        return {
-            "prompt_token_count": prompt_token_count,
-            "candidates_token_count": candidates_token_count,
-            "cached_content_token_count": (cached_content_token_count),
-        }
+        """Extracts normalized token-usage counters from the response, if present."""
+        return usage_from_message(response)
 
     async def _invoke_model(
         self,
@@ -370,9 +356,10 @@ class Diagnoser:
         if submit_tool:
             submit_tool.invoke(args)
 
-        outcome = f"Analysis: {analysis} | Actionable Steps: "
-        for step in steps:
-            outcome += f"{step} "
+        outcome = f"Analysis: {analysis}"
+        if steps:
+            numbered = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+            outcome += f"\nActionable steps:\n{numbered}"
         return outcome
 
     def _max_iteration_outcome(self, response, outcome: str) -> str:
@@ -495,7 +482,7 @@ class Diagnoser:
                         result = get_tool_result_content(result_obj)
                         result_str, _ = split_multimodal_result(result)
                         span.result = result
-                        if result_str.startswith("Error"):
+                        if is_tool_failure(result_obj):
                             status = "error"
                             span.status = "failed"
                             span.error = result

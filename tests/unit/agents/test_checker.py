@@ -14,12 +14,15 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 import pytest
 
 from artemis.agents.checker.checker import (
     CheckReport,
     CheckVerdict,
     _normalize_report,
+    _run_check_loop,
     assemble_checker_prompt_segments,
     build_checker_tools,
     build_probe_argv,
@@ -28,6 +31,7 @@ from artemis.agents.checker.checker import (
     verdicts_allow_release,
 )
 from artemis.context import ArtemisContext, ExecutionSetup
+from artemis.core.tool_failure import ToolFailure
 from artemis.graph.checkpoints import EvidenceAnchor
 from artemis.utils.plan_grammar import CheckItem
 
@@ -396,7 +400,7 @@ async def test_replay_steps_result_is_a_plain_tool_message(tmp_path):
     assert tool_msg.name == "replay_steps"
     assert "- **Step 3 (Start: 9.0s)**" in tool_msg.content
     assert "[Screen]: Saved the alarm." in tool_msg.content
-    assert "[Planned Action]: Tapped 'Save' at [0.5, 0.5]" in tool_msg.content
+    assert "[Action]: Tapped 'Save' at [0.5, 0.5]" in tool_msg.content
 
 
 # --- Streamed-reasoning transcript (replay of the live Thought/Work text) -------------
@@ -569,3 +573,209 @@ async def test_no_transcript_without_attempt_id_or_streamed_text(tmp_path):
 
     assert _read_streams(tmp_path) == []
     assert not (tmp_path / "check_streams.jsonl").exists()
+
+
+# --- Probe failures are structural; history rows keep target provenance ---------------
+
+
+@pytest.mark.asyncio
+async def test_probe_device_invalid_kind_is_a_tool_failure():
+    """A refused probe answers with a ToolFailure, so the tool loop marks the
+    ToolMessage as an error structurally rather than by sniffing its wording."""
+    from artemis.agents.checker.checker import get_probe_tool
+    from artemis.core.tool_failure import is_tool_failure
+
+    tool = get_probe_tool(_mock_ctx(disable_device_probes=False))
+    result = await tool.ainvoke({"kind": "shell", "params": None})
+    assert is_tool_failure(result)
+    assert "Error" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_probe_device_execution_error_is_a_tool_failure():
+    from artemis.agents.checker.checker import get_probe_tool
+    from artemis.core.tool_failure import is_tool_failure
+
+    ctx = _mock_ctx(disable_device_probes=False)
+    ctx.get_adb_client.side_effect = RuntimeError("no adb")
+    tool = get_probe_tool(ctx)
+    result = await tool.ainvoke({"kind": "battery", "params": None})
+    assert is_tool_failure(result)
+    assert "no adb" in str(result)
+
+
+def test_format_history_marks_self_described_targets_only():
+    """A step without a summary renders its action through the shared renderer,
+    so the Checker sees which target labels are the model's own statement."""
+    from artemis.agents.checker.checker import _format_history
+    from artemis.utils.task_tree import SELF_DESCRIBED_MARKER
+
+    ctx = _mock_ctx()
+    ctx.data_engine.get_agent_friendly_steps.return_value = [
+        {
+            "step_number": 1,
+            "relative_time": "T+00:01",
+            "summary": "",
+            "action_taken": {
+                "action": "click",
+                "coordinates": [500, 600],
+                "target_description": "play button",
+            },
+        },
+        {
+            "step_number": 2,
+            "relative_time": "T+00:05",
+            "summary": None,
+            "action_taken": {
+                "action": "click",
+                "coordinates": [100, 200],
+                "target_text": "Login",
+                "target_resource_id": "com.app:id/login",
+            },
+        },
+    ]
+
+    text = _format_history(ctx)
+    lines = text.splitlines()
+    assert lines[0].startswith("- Step 1 (T+00:01): ")
+    assert f"'play button' {SELF_DESCRIBED_MARKER}" in lines[0]
+    assert lines[1].startswith("- Step 2 (T+00:05): ")
+    assert "'Login'" in lines[1]
+    assert SELF_DESCRIBED_MARKER not in lines[1]
+    # Neither row is the raw JSON record.
+    assert "target_description" not in text
+    assert "target_resource_id" not in text
+
+
+def test_format_history_uses_session_offsets_and_skips_empty_steps():
+    """Rows carry the session-relative ``T+mm:ss`` clock every agent shares
+    (from the step timestamp, else from the engine's ``97.7s`` label), and a
+    step with neither summary nor action renders no row."""
+    from artemis.agents.checker.checker import _format_history
+
+    ctx = _mock_ctx()
+    ctx.data_engine.session_start_time = 1000.0
+    ctx.data_engine.get_agent_friendly_steps.return_value = [
+        {"step_number": 1, "timestamp": 1097.7, "summary": "Opened the app"},
+        {"step_number": 2, "relative_time": "12.4s", "summary": "", "action_taken": None},
+        {
+            "step_number": 3,
+            "relative_time": "130.0s",
+            "summary": None,
+            "action_taken": {"action": "click", "coordinates": [1, 2], "target_text": "Login"},
+        },
+    ]
+
+    lines = _format_history(ctx).splitlines()
+    assert len(lines) == 2
+    assert lines[0] == "- Step 1 (T+01:37): Opened the app"
+    assert lines[1].startswith("- Step 3 (T+02:10): ")
+    assert "'Login'" in lines[1]
+
+
+async def _final_check_human_text(ctx) -> str:
+    report = CheckReport(verdicts=[])
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(return_value=report)
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    response = MagicMock()
+    response.tool_calls = []
+    acomplete_mock = AsyncMock(return_value=response)
+
+    with (
+        patch("artemis.agents.checker.checker.get_llm", return_value=llm),
+        patch("artemis.agents.checker.checker.acomplete", new=acomplete_mock),
+        patch(
+            "artemis.agents.checker.checker._capture_final_screen",
+            new=AsyncMock(return_value=(None, "elements")),
+        ),
+    ):
+        await run_final_check(ctx, goal="the goal", plan_text="- [x] G", ledger=[], check_items=[])
+
+    messages = acomplete_mock.await_args.args[1]
+    human = messages[-1]
+    return "\n".join(
+        block["text"] for block in human.content if isinstance(block, dict) and "text" in block
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_review_lists_user_guidance_from_the_step_records():
+    """Every mid-run user instruction reaches the final review, read from the
+    step it was stamped on, so the goal is audited as amended by it."""
+    ctx = _mock_ctx()
+    ctx.data_engine.get_agent_friendly_steps.return_value = [
+        {"step_number": 1, "relative_time": "3.0s", "summary": "s1", "extra_metadata": {}},
+        {
+            "step_number": 2,
+            "relative_time": "65.0s",
+            "summary": "s2",
+            "extra_metadata": {"injected_instruction": "Skip the login"},
+        },
+    ]
+    text = await _final_check_human_text(ctx)
+    section = text.split("# User guidance received during the run\n", 1)[1].split("\n\n", 1)[0]
+    assert section == '- Step 2 (T+01:05): "Skip the login"'
+    # The system prompt audits the goal as amended by that guidance.
+    from artemis.agents.checker.checker import _load_prompts
+
+    assert "as amended by the user guidance" in _load_prompts()["final_guide"]
+
+
+@pytest.mark.asyncio
+async def test_final_review_reports_no_guidance_explicitly():
+    ctx = _mock_ctx()
+    text = await _final_check_human_text(ctx)
+    assert "# User guidance received during the run\n(none)\n" in text
+
+
+# --- tool results: status is structural, never sniffed from the words -----------------
+
+
+# A helper tool reports failure structurally (``ToolFailure``); free-form text
+# that merely starts with "Error" is an ordinary answer.
+_STATUS_CASES = [
+    pytest.param(ToolFailure("Error: note 'progress' not found"), "error", id="tool_failure"),
+    pytest.param("Error 404 was typed into the search box", "success", id="plain_error_text"),
+]
+
+
+def _text_tool(name: str, result):
+    async def _run(key: str) -> str:
+        return result
+
+    return StructuredTool.from_function(coroutine=_run, name=name, description=name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result, expected_status", _STATUS_CASES)
+async def test_check_loop_tool_message_status_is_structural(result, expected_status):
+    ctx = _mock_ctx()
+    tool = _text_tool("read_note", result)
+    tool_turn = AIMessage(
+        content="", tool_calls=[{"name": "read_note", "args": {"key": "progress"}, "id": "c1"}]
+    )
+    final_turn = AIMessage(content="done", tool_calls=[])
+
+    llm = MagicMock()
+    llm.bind_tools.return_value = llm
+    llm.with_structured_output.return_value.ainvoke = AsyncMock(
+        return_value=CheckReport(verdicts=[])
+    )
+    messages = [SystemMessage(content="s"), HumanMessage(content="h")]
+
+    with (
+        patch("artemis.agents.checker.checker.get_llm", return_value=llm),
+        patch(
+            "artemis.agents.checker.checker.acomplete",
+            new=AsyncMock(side_effect=[tool_turn, final_turn]),
+        ),
+    ):
+        await _run_check_loop(ctx, messages, [tool], check_items=[])
+
+    tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].tool_call_id == "c1"
+    assert tool_msgs[0].status == expected_status
+    assert tool_msgs[0].content == str(result)

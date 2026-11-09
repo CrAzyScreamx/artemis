@@ -18,9 +18,10 @@ import os
 from pathlib import Path
 import re
 
+from artemis.core.tool_failure import ToolFailure
 from artemis.data_engine.engine import _CURRENT_DATA_ENGINE
-from artemis.utils.logger import get_logger
 from artemis.utils.plan_grammar import parse_plan
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -375,18 +376,19 @@ def format_read_note_success(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> str:
-    """Formats the success message for reading a note."""
-    range_str = ""
+    """The read result: a one-line header naming the note and its extent, then the content."""
     if start_line is not None or end_line is not None:
-        range_str = f" (lines {start_line or 1} to {end_line or 'end'})"
-    return f"Successfully read note '{key}'{range_str}. '{key}' note content:\n{content}"
+        extent = f"lines {start_line or 1} to {end_line or 'end'}"
+    else:
+        extent = f"{len(content.splitlines())} lines"
+    return f"Note '{key}' ({extent}):\n{content}"
 
 
 def format_read_note_failure(key: str, error: str) -> str:
     """Formats the failure message for reading a note."""
     if "not found" in error.lower():
-        return f"Note '{key}' not found in scratchpad."
-    return f"Failed to read note '{key}': {error}"
+        return ToolFailure(f"Note '{key}' not found. Use list_notes to see the saved keys.")
+    return ToolFailure(f"Failed to read note '{key}': {error}")
 
 
 def format_list_notes_success(notes_info: dict[str, int]) -> str:
@@ -399,7 +401,7 @@ def format_list_notes_success(notes_info: dict[str, int]) -> str:
 
 def format_list_notes_failure(error: str) -> str:
     """Formats the failure message for listing notes."""
-    return f"Failed to list notes: {error}"
+    return ToolFailure(f"Failed to list notes: {error}")
 
 
 def record_subgoal_hash_chain(

@@ -14,22 +14,20 @@
 
 """MCP-backed action executor for the FlashRunner.
 
-Same public contract as the legacy ``MobileActionExecutor`` --
-``execute(name, args, tool_call_id, state) -> ToolExecutionResult`` -- but execution
-routes through the in-process action MCP session, and dispatch is table-driven so a
-backend's extension tools are callable without touching this file.
+Device actions use the in-process MCP session. Argument normalization,
+element-index resolution, coordinate descriptions, smart swipes, post-action
+observations, state updates, tracing, and helper tools are handled here on the
+agent side.
 
-Kept agent-side (by design, not omission): argument normalization, element-index
-resolution against LangGraph ``State``, smart-swipe resolution, act-then-observe
-capture and ``State`` write-back, tracing (a ``ContextVar`` cannot cross the server's
-task boundary -- see the plan's R2), and the non-device tools (``read_note``,
-``list_notes``, ``ask_explorer``, ``video_analyzer`` and the shared history tools
-``search_history`` / ``replay_steps`` / ``get_step_screenshot``).
+Flash binds the same agent dialect as the Pro Operator: a ``click``,
+``long_press`` or ``input_text`` target is either an element index into the
+indexed ``--- Visible UI Elements ---`` list (resolved here to the element's
+center, its observed text/bounds/id recorded) or a normalized ``[x, y]`` pair
+carrying the model's own ``target_description``. The wire only ever sees
+coordinates.
 
-Status is carried by ``ActionResult.ok`` -- the historical substring sniffing on
-``"Error"``/``"Failed"`` is gone, so typing the literal text "Failed" into a field no
-longer marks the step as failed, and a successful tap with a failed screenshot is no
-longer misreported as an error.
+Device action status comes from ``ActionResult.ok``; helper tools report failures
+through ``ToolFailure`` or an explicit status.
 """
 
 import ast
@@ -38,6 +36,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from artemis.core.tool_failure import ToolFailure, is_tool_failure
 from artemis.context import ArtemisContext
 from artemis.controllers.unified_controller import UnifiedMobileController
 from artemis.data_engine.trace import TraceSpan
@@ -56,8 +55,6 @@ from artemis.utils.coordinates import (
     compute_smart_swipe_coordinates,
     parse_swipe_parameters,
 )
-from artemis.utils.element_hit_test import hit_test_semantics
-from artemis.utils.logger import get_logger
 from artemis.utils.notes import (
     format_list_notes_failure,
     format_list_notes_success,
@@ -65,6 +62,7 @@ from artemis.utils.notes import (
     list_notes_info,
     read_note_content,
 )
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -75,6 +73,9 @@ __all__ = ["McpActionExecutor"]
 AGENT_TOOL_NAMES: frozenset[str] = (
     frozenset({"read_note", "list_notes", "ask_explorer", "video_analyzer"}) | HISTORY_TOOL_NAMES
 )
+
+#: Actions whose ``target`` is a single point: an element index or an [x, y] pair.
+_POINT_TARGET_ACTIONS: frozenset[str] = frozenset({"click", "long_press", "input_text"})
 
 
 class _ArgError(ValueError):
@@ -118,15 +119,28 @@ class McpActionExecutor:
         args: dict[str, Any],
         tool_call_id: str,
         state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
     ) -> ToolExecutionResult:
-        """Executes the named tool and wraps the outcome for the calling agent."""
+        """Executes the named tool and wraps the outcome for the calling agent.
+
+        ``index_elements`` is the element list an index target (``click(3)``)
+        resolves against; ``None`` means ``state.indexed_elements`` at call
+        time. A multi-action turn passes the list from the observation the
+        model decided on, so its later indices are not resolved against the
+        list refreshed by its earlier actions (``state.indexed_elements`` is
+        still refreshed after every action: it is what the next observation
+        shows).
+        """
         raw_name = name.split(":")[-1] if ":" in name else name
 
         if raw_name in AGENT_TOOL_NAMES:
             return await self._execute_agent_tool(raw_name, name, args, tool_call_id, state)
 
         if raw_name in self.action_tool_names:
-            return await self._execute_device_action(raw_name, name, args, tool_call_id, state)
+            return await self._execute_device_action(
+                raw_name, name, args, tool_call_id, state, index_elements=index_elements
+            )
 
         return ToolExecutionResult(
             tool_call_id=tool_call_id,
@@ -144,6 +158,8 @@ class McpActionExecutor:
         args: dict[str, Any],
         tool_call_id: str,
         state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
     ) -> ToolExecutionResult:
         span = TraceSpan(name=raw_name, trace_type="action", ctx=self.ctx)
         span.payload = {"args": args}
@@ -153,19 +169,19 @@ class McpActionExecutor:
         img_bytes: bytes | None = None
         shot_path: str | None = None
         xml_list: str | None = None
-        target_semantics: dict[str, Any] | None = None
-
+        target_semantics: dict[str, Any] = {}
+        target_coordinates: list[int] | None = None
         with span:
             try:
                 session = await self._session_or_start()
-                wire_name, wire_args, finalize = self._translate(raw_name, args, state)
-                # Record-time enrichment: bare-coordinate targeted actions get
-                # best-effort element semantics from the pre-action frame (the
-                # post-action observe below overwrites state.indexed_elements,
-                # so this must happen before the device call).
-                target_semantics = self._target_semantics(raw_name, wire_args, state)
-                if target_semantics:
-                    span.payload = {"args": {**args, **target_semantics}}
+                wire_name, wire_args, finalize, target_semantics = self._translate(
+                    raw_name, args, state, index_elements=index_elements
+                )
+                if raw_name in _POINT_TARGET_ACTIONS:
+                    # The normalized point the action was sent to: the recorded
+                    # coordinates of an index target (the model named an index,
+                    # not a point).
+                    target_coordinates = wire_args.get("target")
                 extension = raw_name not in (REQUIRED_ACTIONS | OPTIONAL_ACTIONS)
 
                 if extension:
@@ -230,74 +246,15 @@ class McpActionExecutor:
                 "code": res.code.value,
                 "normalized_coordinates": res.normalized_coordinates,
                 "target_semantics": target_semantics,
+                "target_coordinates": target_coordinates,
             },
         )
 
-    def _target_semantics(
-        self, raw_name: str, wire_args: dict[str, Any], state: Any
-    ) -> dict[str, Any] | None:
-        """Best-effort element semantics for a coordinate-targeted action.
-
-        Hit tests the normalized (0-1000) target point(s) against the
-        pre-action frame's indexed elements. Single-target actions get the
-        flat ``target_*`` fields; multi-point actions (``click_sequence``,
-        ``swipe``) hit test every point best-effort (M5), hoisting the FIRST
-        point's semantics to the main ``target_*`` label and keeping the
-        per-point results alongside. Returns None for actions without a
-        resolvable coordinate target; degrades to
-        ``target_label_source: "none"`` when no element data covers the point.
-        """
-        try:
-            elements = getattr(state, "indexed_elements", None) if state else None
-
-            if raw_name in ("click", "long_press", "input_text"):
-                target = wire_args.get("target")
-                if not (isinstance(target, (list, tuple)) and len(target) == 2):
-                    return None
-                return self._hit_test_point(elements, target)
-
-            if raw_name == "click_sequence":
-                sequence = wire_args.get("sequence")
-                if not (isinstance(sequence, (list, tuple)) and sequence):
-                    return None
-                points = [self._hit_test_point(elements, p) for p in sequence]
-                semantics: dict[str, Any] = dict(points[0])
-                semantics["points_semantics"] = points
-                return semantics
-
-            if raw_name == "swipe":
-                start = wire_args.get("start")
-                end = wire_args.get("end")
-                if not (isinstance(start, (list, tuple)) and len(start) == 2):
-                    return None
-                semantics = dict(self._hit_test_point(elements, start))
-                semantics["start_semantics"] = self._hit_test_point(elements, start)
-                if isinstance(end, (list, tuple)) and len(end) == 2:
-                    semantics["end_semantics"] = self._hit_test_point(elements, end)
-                return semantics
-
-            return None
-        except Exception as enrich_err:
-            logger.debug(f"Target semantics enrichment skipped for {raw_name}: {enrich_err}")
-            return {"target_label_source": "none"}
-
-    def _hit_test_point(self, elements: Any, target: Any) -> dict[str, Any]:
-        """Hit tests one normalized (0-1000) point; never raises."""
-        try:
-            width = getattr(self.ctx.device, "device_width", 1080) if self.ctx.device else 1080
-            height = getattr(self.ctx.device, "device_height", 2400) if self.ctx.device else 2400
-            x_px = int(max(0, min(width - 1, float(target[0]) * width / 1000)))
-            y_px = int(max(0, min(height - 1, float(target[1]) * height / 1000)))
-            return hit_test_semantics(elements, x_px, y_px)
-        except Exception:
-            return {"target_label_source": "none"}
-
     @staticmethod
     def _observe_despite_failure(raw_name: str, res: ActionResult) -> bool:
-        """Failures that still observe the screen, mirroring the legacy executor.
+        """Capture the screen after launch failures and wait_for_text timeouts.
 
-        A failed app launch and a wait_for_text timeout captured the screen; argument
-        and package errors returned without one.
+        Argument and package lookup errors do not require an observation.
         """
         if raw_name == "manage_app":
             return res.code not in (ActionCode.PACKAGE_NOT_FOUND, ActionCode.INVALID_ARGS)
@@ -308,45 +265,68 @@ class McpActionExecutor:
     # --- Argument translation --------------------------------------------------------
 
     def _translate(
-        self, raw_name: str, args: dict[str, Any], state: Any
-    ) -> tuple[str, dict[str, Any], Any]:
-        """Maps agent-facing args to wire args; returns (name, args, finalize).
+        self,
+        raw_name: str,
+        args: dict[str, Any],
+        state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any], Any, dict[str, Any]]:
+        """Maps agent-facing args to wire args; returns (name, args, finalize, recorded).
 
-        ``finalize(res)`` post-processes the ActionResult message where the historical
-        wording depended on client-side context (direction swipes).
+        ``finalize(res)`` adds client-side context to swipe result messages.
+        ``recorded`` holds the target semantics in the Pro Operator's record
+        format: the observed element fields of an index target, or the validated
+        ``target_description`` of a coordinate target. Focused input and
+        directional swipes have no target, so they record nothing.
+        ``index_elements`` overrides the list index targets resolve against
+        (see :meth:`execute`).
         """
         if raw_name == "click":
-            target = self._require_pair(
-                args.get("target") or args.get("coordinates") or [], "click"
+            target, recorded = self._resolve_target(
+                args.get("target") or args.get("coordinates"),
+                "click",
+                args,
+                state,
+                index_elements=index_elements,
             )
             return (
                 "click",
                 {
-                    "target": list(target),
+                    "target": target,
                     "times": args.get("times", 1),
                     "delay_ms": args.get("delay_ms", 100),
                 },
                 None,
+                recorded,
             )
 
         if raw_name == "long_press":
-            target = self._require_pair(
-                args.get("target") or args.get("coordinates") or [], "long press"
+            target, recorded = self._resolve_target(
+                args.get("target") or args.get("coordinates"),
+                "long press",
+                args,
+                state,
+                index_elements=index_elements,
             )
             return (
                 "long_press",
                 {
-                    "target": list(target),
+                    "target": target,
                     "duration_ms": args.get("duration_ms", args.get("duration", 1000)),
                 },
                 None,
+                recorded,
             )
 
         if raw_name == "input_text":
             raw_target = args.get("target") or args.get("coordinates")
             target = None
+            recorded = {}
             if raw_target:
-                target = list(self._require_pair(raw_target, "input text"))
+                target, recorded = self._resolve_target(
+                    raw_target, "input text", args, state, index_elements=index_elements
+                )
             return (
                 "input_text",
                 {
@@ -355,23 +335,27 @@ class McpActionExecutor:
                     "clear_exist": args.get("clear_exist", True),
                 },
                 None,
+                recorded,
             )
 
         if raw_name == "click_sequence":
+            sequence = self._resolve_sequence(args.get("sequence") or [])
+            recorded = self._require_descriptions(args, len(sequence))
             return (
                 "click_sequence",
                 {
-                    "sequence": self._resolve_sequence(args.get("sequence") or [], state),
+                    "sequence": sequence,
                     "delay_ms": args.get("delay_ms", 50),
                 },
                 None,
+                recorded,
             )
 
         if raw_name == "swipe":
-            return self._translate_swipe(args, state)
+            return self._translate_swipe(args, state, index_elements=index_elements)
 
         if raw_name == "press_key":
-            return "press_key", {"key": args.get("key", "BACK")}, None
+            return "press_key", {"key": args.get("key", "BACK")}, None, {}
 
         if raw_name == "manage_app":
             return (
@@ -381,10 +365,11 @@ class McpActionExecutor:
                     "app_name": args.get("app_name", ""),
                 },
                 None,
+                {},
             )
 
         if raw_name == "wait_for_delay":
-            return "wait_for_delay", {"time_in_ms": args.get("time_in_ms", 1000)}, None
+            return "wait_for_delay", {"time_in_ms": args.get("time_in_ms", 1000)}, None, {}
 
         if raw_name == "wait_for_text":
             return (
@@ -395,25 +380,142 @@ class McpActionExecutor:
                     "timeout_ms": args.get("timeout_ms", 5000),
                 },
                 None,
+                {},
             )
 
         # Backend extension: pass the arguments straight through.
-        return raw_name, dict(args), None
+        return raw_name, dict(args), None, {}
+
+    def _screen_size(self) -> tuple[int, int]:
+        """The device resolution the indexed element list was built against."""
+        device = getattr(self.ctx, "device", None)
+        width = getattr(device, "device_width", None) if device else None
+        height = getattr(device, "device_height", None) if device else None
+        return (
+            width if isinstance(width, int) and width > 0 else 1080,
+            height if isinstance(height, int) and height > 0 else 2400,
+        )
+
+    def _resolve_target(
+        self,
+        raw: Any,
+        label: str,
+        args: dict[str, Any],
+        state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Resolves a point target to ``([x, y] normalized, recorded semantics)``.
+
+        An element index carries observed semantics (text, bounds, id, class
+        straight from the indexed list); a coordinate pair carries only the
+        model's own ``target_description``. The two never mix (Pro parity).
+        """
+        target = normalize_coordinate_target(raw)
+        if isinstance(target, bool):
+            target = None
+        if isinstance(target, (int, float)):
+            return self._resolve_index(int(target), label, state, index_elements=index_elements)
+        if isinstance(target, (list, tuple)) and len(target) == 2:
+            recorded = self._require_description(args, label)
+            return [int(target[0]), int(target[1])], recorded
+        raise _ArgError(
+            f"Error during {label}: Invalid target format: {raw!r}. Use an element"
+            " index from the Visible UI Elements list (e.g. 3) or normalized [x, y]"
+            " coordinates with a target_description."
+        )
+
+    def _resolve_index(
+        self,
+        index: int,
+        label: str,
+        state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Maps an element index onto the element's center (normalized 0-1000).
+
+        The recorded fields are what the Operator records for an index target,
+        with bounds normalized like every other Flash coordinate. The index is
+        resolved against ``index_elements`` when given, else against the
+        state's current list.
+        """
+        elements = self._index_elements(state, index_elements)
+        if not 1 <= index <= len(elements):
+            hint = (
+                " The list is empty on this screen."
+                if not elements
+                else f" Active index range is 1 to {len(elements)}."
+            )
+            raise _ArgError(
+                f"Error during {label}: Invalid target index {index}.{hint} Use an index"
+                " shown in the Visible UI Elements list, or normalized [x, y]"
+                " coordinates with a target_description (ask_explorer can locate an"
+                " element that is visible but not listed)."
+            )
+        element = elements[index - 1]
+        width, height = self._screen_size()
+
+        def _norm_x(v: Any) -> int:
+            return int(max(0, min(1000, round(float(v) * 1000 / max(1, width)))))
+
+        def _norm_y(v: Any) -> int:
+            return int(max(0, min(1000, round(float(v) * 1000 / max(1, height)))))
+
+        center = element.get("center")
+        if not (isinstance(center, (list, tuple)) and len(center) == 2):
+            raise _ArgError(f"Error during {label}: element [{index}] has no usable center.")
+        bounds = element.get("bounds")
+        norm_bounds = None
+        if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+            norm_bounds = [
+                _norm_x(bounds[0]),
+                _norm_y(bounds[1]),
+                _norm_x(bounds[2]),
+                _norm_y(bounds[3]),
+            ]
+        recorded = {
+            "target_text": element.get("text"),
+            "target_bounds": norm_bounds,
+            "target_resource_id": element.get("resource_id"),
+            "target_class": element.get("class"),
+        }
+        return [_norm_x(center[0]), _norm_y(center[1])], recorded
 
     @staticmethod
-    def _require_pair(raw: Any, label: str) -> tuple[int, int]:
-        target = normalize_coordinate_target(raw)
-        if not isinstance(target, (list, tuple)) or len(target) != 2:
-            prefix = {
-                "click": "Error during click",
-                "long press": "Error during long press",
-                "input text": "Error during input text",
-            }[label]
-            raise _ArgError(f"{prefix}: Invalid target format: {raw}")
-        return int(target[0]), int(target[1])
+    def _require_description(args: dict[str, Any], label: str) -> dict[str, Any]:
+        """Validate and trim the coordinate target description for the action record."""
+        description = args.get("target_description")
+        if not (isinstance(description, str) and description.strip()):
+            raise _ArgError(
+                f"Error during {label}: 'target_description' is required (what the"
+                " target is, in a few words)."
+            )
+        return {"target_description": description.strip()}
 
-    def _resolve_sequence(self, sequence: Any, state: Any) -> list[list[int]]:
-        """Resolves click_sequence entries (indices or pairs) to normalized pairs."""
+    @staticmethod
+    def _require_descriptions(args: dict[str, Any], count: int) -> dict[str, Any]:
+        """``click_sequence``: one description per sequence entry, in order.
+
+        Returns the cleaned statements as the recorded ``target_descriptions`` field.
+        """
+        descriptions = args.get("target_descriptions")
+        if isinstance(descriptions, str):
+            descriptions = [descriptions]
+        if (
+            not isinstance(descriptions, (list, tuple))
+            or len(descriptions) != count
+            or not all(isinstance(d, str) and d.strip() for d in descriptions)
+        ):
+            raise _ArgError(
+                "Error during click sequence: 'target_descriptions' is required, one"
+                f" non-empty entry per sequence entry ({count} expected)."
+            )
+        return {"target_descriptions": [d.strip() for d in descriptions]}
+
+    @staticmethod
+    def _resolve_sequence(sequence: Any) -> list[list[int]]:
+        """Normalize click_sequence entries to coordinate pairs; reject element indices."""
         if isinstance(sequence, str):
             sequence_str = sequence.strip()
             try:
@@ -427,33 +529,40 @@ class McpActionExecutor:
         if not isinstance(sequence, (list, tuple)):
             raise _ArgError(f"Error during click sequence: Invalid sequence format: {sequence}")
 
-        width = getattr(self.ctx.device, "device_width", 1080) if self.ctx.device else 1080
-        height = getattr(self.ctx.device, "device_height", 2400) if self.ctx.device else 2400
-
         resolved: list[list[int]] = []
-        for raw_target in sequence:
+        for position, raw_target in enumerate(sequence, start=1):
             target = normalize_coordinate_target(raw_target)
-            if isinstance(target, int):
-                idx = target
-                points = getattr(state, "indexed_points", []) or []
-                if not 1 <= idx <= len(points):
-                    raise _ArgError(
-                        "Error during click sequence: Index"
-                        f" {idx} is out of range (available: {len(points)})"
-                    )
-                px, py = int(points[idx - 1][0]), int(points[idx - 1][1])
-                nx = int(max(0, min(1000, round(px * 1000 / max(1, width)))))
-                ny = int(max(0, min(1000, round(py * 1000 / max(1, height)))))
-            elif isinstance(target, (list, tuple)) and len(target) == 2:
+            if isinstance(target, (int, float)) and not isinstance(target, bool):
+                raise _ArgError(
+                    f"Error during click sequence: entry {position} ({raw_target!r}) is an"
+                    " element index; click_sequence takes normalized [x, y] coordinate"
+                    " pairs only. Use the element's coordinates from the element list,"
+                    " or ask_explorer to locate it."
+                )
+            if isinstance(target, (list, tuple)) and len(target) == 2:
                 nx, ny = int(target[0]), int(target[1])
             else:
                 raise _ArgError(f"Error during click sequence: Invalid target format: {raw_target}")
             resolved.append([nx, ny])
         return resolved
 
-    def _translate_swipe(self, args: dict[str, Any], state: Any) -> tuple[str, dict[str, Any], Any]:
-        width = getattr(self.ctx.device, "device_width", 1080) if self.ctx.device else 1080
-        height = getattr(self.ctx.device, "device_height", 2400) if self.ctx.device else 2400
+    @staticmethod
+    def _index_elements(
+        state: Any, index_elements: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]]:
+        """The element list index targets resolve against (``None`` -> state)."""
+        if index_elements is not None:
+            return index_elements
+        return getattr(state, "indexed_elements", None) or []
+
+    def _translate_swipe(
+        self,
+        args: dict[str, Any],
+        state: Any,
+        *,
+        index_elements: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any], Any, dict[str, Any]]:
+        width, height = self._screen_size()
         default_duration = args.get("duration", 400)
         kind, target, final_duration = parse_swipe_parameters(
             dict(args), default_duration=default_duration
@@ -464,7 +573,7 @@ class McpActionExecutor:
             x1, y1, x2, y2, smart_dur = compute_smart_swipe_coordinates(
                 direction=target,
                 target=args.get("target"),
-                indexed_elements=getattr(state, "indexed_elements", None) if state else None,
+                indexed_elements=self._index_elements(state, index_elements) if state else None,
                 ui_hierarchy=getattr(state, "latest_ui_hierarchy", None) if state else None,
                 width=width,
                 height=height,
@@ -477,7 +586,7 @@ class McpActionExecutor:
             def finalize(res: ActionResult) -> str:
                 if not res.ok:
                     return f"Error swiping {dir_name}: {res.detail}"
-                return f"Swipe completed successfully. Swiped {dir_name}."
+                return f"Swiped {dir_name}."
 
             return (
                 "swipe",
@@ -487,15 +596,17 @@ class McpActionExecutor:
                     "duration_ms": smart_dur,
                 },
                 finalize,
+                {},
             )
 
         if kind == "coords":
             x1, y1, x2, y2 = target
+            recorded = self._require_description(args, "swipe")
 
             def finalize(res: ActionResult) -> str:
                 if not res.ok:
                     return f"Error dragging: {res.detail}"
-                return f"Swipe completed successfully. Swiped from [{x1}, {y1}] to [{x2}, {y2}]."
+                return f"Swiped from [{x1}, {y1}] to [{x2}, {y2}] (normalized)."
 
             return (
                 "swipe",
@@ -505,6 +616,7 @@ class McpActionExecutor:
                     "duration_ms": final_duration,
                 },
                 finalize,
+                recorded,
             )
 
         raise _ArgError(f"Error during swipe: Invalid direction: {args}")
@@ -537,7 +649,6 @@ class McpActionExecutor:
                 )
             elif raw_name in HISTORY_TOOL_NAMES:
                 text, blocks = await self._history_tool(raw_name, args)
-                ok = True
             else:
                 text, ok = await self._ask_explorer(
                     # ``task_description`` is the pre-contract argument name
@@ -551,13 +662,11 @@ class McpActionExecutor:
                 span.status = "failed"
                 span.error = text
 
-        # Note texts come from our own failure formatters, so the historical
-        # "Error" marker check is reliable there (unlike free-form device
-        # output); the Explorer and the video analyzer report their status
-        # explicitly and a history lookup's "no match" / "not found" answer
-        # is not an error.
+        # The Explorer and the video analyzer report their status explicitly;
+        # note and history texts carry it structurally (a ``ToolFailure``), so a
+        # history lookup's "no match" answer is an answer, not an error.
         if ok is None:
-            ok = "Error" not in (text or "")
+            ok = not is_tool_failure(text)
         return ToolExecutionResult(
             tool_call_id=tool_call_id,
             tool_name=name,
@@ -597,13 +706,13 @@ class McpActionExecutor:
         """
         tool = history_tool_by_name(raw_name)
         if tool is None:
-            return f"Error: Tool '{raw_name}' not supported.", None
+            return ToolFailure(f"Error: Tool '{raw_name}' not supported."), None
         accepted = {k: v for k, v in args.items() if k in tool.args_schema.model_fields}
         try:
             result = await tool.execute(ctx=self.ctx, **accepted)
         except Exception as e:
             logger.error(f"Error running {raw_name}: {e}")
-            return f"{raw_name} failed: {e}", None
+            return ToolFailure(f"{raw_name} failed: {e}"), None
         text, images = split_multimodal_result(result)
         if images:
             return text or "Screenshot attached.", result
@@ -643,6 +752,9 @@ class McpActionExecutor:
                 self.ctx, state, query, context_feedback or "", agent_name=self.agent_name
             )
             registered = register_candidates(self.ctx, state, outcome)
-            return render_text(query, outcome, registered), not outcome.error
+            # Candidates join ``state.indexed_elements``, and this executor's
+            # ``click`` resolves an index against that list (Pro parity), so the
+            # answer teaches the index syntax next to the coordinates.
+            return render_text(query, outcome, registered, index_targets=True), not outcome.error
         except Exception as e:
             return f"Error executing ask_explorer: {e}", False

@@ -23,6 +23,23 @@ from artemis.utils.plan_grammar import parse_plan
 
 logger = logging.getLogger(__name__)
 
+#: Suffix on a rendered target label whose text is the acting model's own
+#: ``target_description`` (a coordinate target) rather than the element text
+#: observed in the UI tree (an index target). Every later reader of the history
+#: (Checker, Planner, Summarizer, incident block) sees which kind it is.
+SELF_DESCRIBED_MARKER = "(self-described)"
+
+
+def _target_label(action_obj: dict, *, fallback: str) -> str:
+    """The quoted target label, provenance-marked, or ``fallback`` when unnamed."""
+    observed = action_obj.get("target_text")
+    if observed:
+        return f"'{observed}'"
+    described = action_obj.get("target_description")
+    if described:
+        return f"'{described}' {SELF_DESCRIBED_MARKER}"
+    return fallback
+
 
 def format_action_clean(action_obj) -> str:
     if not action_obj:
@@ -49,7 +66,6 @@ def format_action_clean(action_obj) -> str:
         merged.setdefault("intent", raw_args.get("action"))
         action_obj = merged
 
-    target_text = action_obj.get("target_text") or action_obj.get("text")
     coords = action_obj.get("coordinates") or action_obj.get("target")
     app_name = (
         action_obj.get("app_name")
@@ -60,9 +76,13 @@ def format_action_clean(action_obj) -> str:
     )
     keycode = action_obj.get("keycode") or action_obj.get("key")
 
-    if act_type in ("tap", "click", "long_press"):
-        label = f"'{target_text}'" if target_text else "element"
-        if act_type == "long_press":
+    if act_type in ("tap", "click", "long_press", "long_press_on"):
+        # Legacy records carried the label under ``text``; the typed text of an
+        # input action never reaches this branch.
+        label = _target_label(action_obj, fallback="element")
+        if label == "element" and action_obj.get("text"):
+            label = f"'{action_obj['text']}'"
+        if act_type in ("long_press", "long_press_on"):
             duration = action_obj.get("duration") or action_obj.get("duration_ms")
             duration_str = f" for {duration}ms" if duration else ""
             return f"Long pressed {label} at {coords}{duration_str}"
@@ -82,10 +102,9 @@ def format_action_clean(action_obj) -> str:
             else:
                 return f"Tapped {label} at {coords}"
     elif act_type in ("input_text", "focus_and_input_text"):
-        # The field label is the resolved target's text only — the typed text
-        # is not the field's name.
-        field_text = action_obj.get("target_text")
-        label = f"'{field_text}'" if field_text else "field"
+        # The field label is the resolved target's text (or the model's own
+        # description of the field) only — the typed text is not the field's name.
+        label = _target_label(action_obj, fallback="field")
         text_val = action_obj.get("text")
         clear_exist = action_obj.get("clear_exist") or action_obj.get("clear_before_input")
         clear_str = " (without clearing)" if clear_exist is False else ""
@@ -100,8 +119,6 @@ def format_action_clean(action_obj) -> str:
             direction = action_obj.get("intent")
         duration = action_obj.get("duration") or action_obj.get("duration_ms")
         duration_str = f" over {duration}ms" if duration else ""
-        if direction:
-            return f"Swiped {direction}{duration_str}"
 
         start_coords = action_obj.get("start_coordinates")
         end_coords = action_obj.get("end_coordinates")
@@ -110,7 +127,17 @@ def format_action_clean(action_obj) -> str:
             if isinstance(coords_list, list) and len(coords_list) == 4:
                 start_coords = coords_list[:2]
                 end_coords = coords_list[2:]
-        return f"Swiped from {start_coords} to {end_coords}{duration_str}"
+        if not start_coords or not end_coords:
+            start_coords = action_obj.get("normalized_start_coordinates")
+            end_coords = action_obj.get("normalized_end_coordinates")
+        if direction:
+            # A directional swipe is what the agent issued; the recorded path
+            # (when any) is the detail, not the headline.
+            path = f" (from {start_coords} to {end_coords})" if start_coords and end_coords else ""
+            return f"Swiped {direction}{path}{duration_str}"
+        dragged = _target_label(action_obj, fallback="")
+        dragged_str = f" {dragged}" if dragged else ""
+        return f"Swiped{dragged_str} from {start_coords} to {end_coords}{duration_str}"
     elif act_type == "press_key":
         return f"Pressed key '{keycode}'"
     elif act_type == "launch_app":
@@ -142,10 +169,45 @@ def format_action_clean(action_obj) -> str:
         )
         return f"Waited for {delay_val}"
     elif act_type in ("click_sequence", "tap_sequence"):
-        seq = action_obj.get("target") or action_obj.get("sequence") or []
+        seq = (
+            action_obj.get("target")
+            or action_obj.get("sequence")
+            or action_obj.get("coordinates")
+            or []
+        )
+        descriptions = action_obj.get("target_descriptions")
+        if isinstance(descriptions, (list, tuple)) and len(descriptions) == len(seq) and seq:
+            labelled = ", ".join(
+                f"'{d}' {SELF_DESCRIBED_MARKER} at {p}" for d, p in zip(descriptions, seq)
+            )
+            return f"Tapped sequence of targets: {labelled}"
         return f"Tapped sequence of targets: {seq}"
+    elif act_type == "wait_for_text":
+        state = str(action_obj.get("wait_state") or "appear")
+        timeout = action_obj.get("timeout_ms")
+        timeout_str = f" (timeout {timeout}ms)" if timeout else ""
+        return f"Waited for text '{action_obj.get('text', '')}' to {state}{timeout_str}"
+    elif act_type == "open_link":
+        return f"Opened link '{action_obj.get('url', '')}'"
+    elif act_type == "erase_one_char":
+        return "Erased one character"
+    elif act_type == "focus_and_clear_text":
+        return f"Cleared text at {coords}"
     else:
-        return f"Action: {act_type} with args: {json.dumps(action_obj, ensure_ascii=False)}"
+        # Unknown action: show only the agent-facing arguments, never the
+        # bookkeeping keys the record carries for other consumers.
+        internal = {
+            "action",
+            "name",
+            "intent",
+            "coordinate_space",
+            "normalized_coordinates",
+            "normalized_start_coordinates",
+            "normalized_end_coordinates",
+        }
+        shown = {k: v for k, v in action_obj.items() if k not in internal and v is not None}
+        args_str = f" with args: {json.dumps(shown, ensure_ascii=False)}" if shown else ""
+        return f"Action: {act_type}{args_str}"
 
 
 def format_actions_clean(actions) -> str:
@@ -160,11 +222,53 @@ def format_actions_clean(actions) -> str:
     return format_action_clean(actions)
 
 
+#: Past-tense outcome prefix (``format_action_clean``) -> intent-form prefix.
+#: Longest prefixes first so "Double tapped" / "Tapped sequence" win over "Tapped".
+_INTENT_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("Tapped sequence of targets: ", "tap sequence of targets: "),
+    ("Double tapped ", "double tap "),
+    ("Long pressed ", "long press "),
+    ("Tapped ", "tap "),
+    ("Inputted ", "type "),
+    ("Swiped ", "swipe "),
+    ("Pressed key ", "press key "),
+    ("Launched app ", "launch app "),
+    ("Stopped app ", "stop app "),
+    ("Managed app ", "manage app "),
+    ("Waited for text ", "wait for text "),
+    ("Waited for ", "wait "),
+    ("Opened link ", "open link "),
+    ("Erased one character", "erase one character"),
+    ("Cleared text ", "clear text "),
+)
+
+
+def action_intent_phrase(description: str) -> str:
+    """The intent form of a rendered action phrase: ``Tapped 'Wi-Fi row' at
+    [500, 520]`` -> ``tap 'Wi-Fi row' at [500, 520]``.
+
+    ``format_action_clean`` renders actions as past-tense outcomes, which
+    reads as success; a failure or incident context must describe what the
+    agent *tried* to do instead. Phrases without a known prefix (bursts,
+    unknown action types) are returned unchanged.
+    """
+    text = str(description or "")
+    for outcome, intent in _INTENT_PREFIXES:
+        if text.startswith(outcome):
+            return intent + text[len(outcome) :]
+    return text
+
+
+def format_action_intent(action_obj) -> str:
+    """Intent-form rendering of one action (``launch app 'X'``, ``swipe up``)."""
+    return action_intent_phrase(format_action_clean(action_obj))
+
+
 def _is_terminal_attempt_failure(attempts) -> bool:
     if not attempts:
         return False
     last = str(attempts[-1])
-    return last != "Success" and not last.startswith("Skipped")
+    return last != "Dispatched" and not last.startswith("Skipped")
 
 
 def failed_execution_error(result_obj) -> str | None:
@@ -184,11 +288,17 @@ def failed_execution_error(result_obj) -> str | None:
 
 
 def format_incident_clean(incident: dict) -> str:
-    """One-line rendering of an execution incident for history and result lines."""
+    """One-line rendering of an execution incident for history and result lines.
+
+    The action is quoted in intent form (``launch app 'X'``): it did not
+    happen, so the past-tense outcome phrase would misreport it as done.
+    """
     kind = incident.get("kind") or "exec_error"
     category = incident.get("category") or "general"
     consecutive = incident.get("consecutive_failures") or 1
-    description = incident.get("action_description") or format_action_clean(incident.get("action"))
+    description = action_intent_phrase(
+        incident.get("action_description") or format_action_clean(incident.get("action"))
+    )
     reason = str(incident.get("reason") or "").strip()
     burst_size = int(incident.get("burst_size") or 1)
     index = int(incident.get("action_index") or 0)
@@ -217,11 +327,17 @@ def format_result_clean(result_obj) -> str | None:
 
     status = result_obj.get("status")
     error = failed_execution_error(result_obj)
-    if status in ("failed", "error"):
-        return f"Error: {error}" if error else "Error"
     if error:
-        return f"Error: {error}"
+        return _error_line(error)
+    if status in ("failed", "error"):
+        return "Error"
     return None
+
+
+def _error_line(error: str) -> str:
+    """One ``Error: ...`` line; executor messages already start with "Error"."""
+    text = str(error).strip()
+    return text if text.lower().startswith("error") else f"Error: {text}"
 
 
 def safe_parse_validation_result(result: Any) -> list:
@@ -256,6 +372,21 @@ def safe_parse_validation_result(result: Any) -> list:
         pass
 
     return []
+
+
+#: Block labels of a detailed / replayed step. Role-neutral on purpose: the
+#: same renderer replays a Flash turn (no Operator) and a Pro Operator turn,
+#: and every Pro agent (Checker, Diagnoser, Outputter) reads them.
+REASONING_BLOCK_LABEL = "[Reasoning & tool calls]"
+ACTION_BLOCK_LABEL = "[Action]"
+BURST_BLOCK_LABEL = "[Fast-Action Burst]"
+
+#: Continuation lines of a "    - " bullet stay inside the bullet.
+_BULLET_CONTINUATION = "\n      "
+
+
+def _indent_continuation(text: str) -> str:
+    return text.replace("\n", _BULLET_CONTINUATION)
 
 
 #: Limit tool-result text in the live context, which is rebuilt every turn.
@@ -315,6 +446,8 @@ def format_tool_call_clean(
             "target_text": (
                 args.get("text") or args.get("target_text") or args.get("target_text_or_desc")
             ),
+            "target_description": args.get("target_description"),
+            "target_descriptions": args.get("target_descriptions"),
             "text": args.get("text"),
             "clear_exist": (args.get("clear_exist") or args.get("clear_before_input")),
             "clear_before_input": args.get("clear_before_input"),
@@ -492,21 +625,39 @@ def _burst_member_status(result: Any, index: int) -> str:
         return ""
     exec_list = result.get("execution") or []
     if index >= len(exec_list) or not isinstance(exec_list[index], dict):
-        return " (not executed)"
+        return " (not dispatched)"
     attempts = exec_list[index].get("attempts") or []
     if not attempts:
-        return " (executed)"
+        return " (dispatched)"
     last = str(attempts[-1])
-    if last == "Success":
-        return " (executed)"
+    if last == "Dispatched":
+        return " (dispatched)"
     if last.startswith("Skipped"):
         return " (skipped)"
     return f" (FAILED: {last.strip()})"
 
 
+def replay_time_label(step: dict, session_start: Any) -> str:
+    """The step-header clock of a replay: the session-relative ``T+mm:ss``
+    offset every agent prompt and ``search_history`` use, or the legacy
+    ``Start: 12.3s`` text when no session start / step timestamp is known."""
+    ts = step.get("timestamp")
+    if (
+        isinstance(session_start, (int, float))
+        and not isinstance(session_start, bool)
+        and isinstance(ts, (int, float))
+        and not isinstance(ts, bool)
+    ):
+        from artemis.memory.chunking import step_offset_label
+
+        return step_offset_label(step, float(session_start))
+    return f"Start: {step.get('relative_time') or 'N/A'}"
+
+
 def render_step_replay(
     step: dict,
     *,
+    session_start: Any = None,
     result_chars: int = REPLAY_RESULT_CHARS,
     include_summary: bool = True,
 ) -> str:
@@ -516,6 +667,9 @@ def render_step_replay(
     / ``get_agent_friendly_steps``): coordinates already normalized, traces
     already expanded into ``interleaved_events``. Used by ``replay_steps`` and
     the MCP trace inspector. Screenshots are fetched separately.
+
+    ``session_start`` (the reader's ``session_start_time``) makes the header
+    carry the ``T+mm:ss`` session clock; see :func:`replay_time_label`.
     """
     return _render_step_detailed(
         step=step,
@@ -526,6 +680,7 @@ def render_step_replay(
         is_most_recent=False,
         result_chars=result_chars,
         include_summary=include_summary,
+        time_label=replay_time_label(step, session_start),
     )
 
 
@@ -557,15 +712,17 @@ def _render_step_detailed(
     *,
     result_chars: int = LIVE_RESULT_CHARS,
     include_summary: bool = False,
+    time_label: str | None = None,
 ) -> str:
-    # 1. Step Header
+    # 1. Step Header (``time_label`` overrides the live window's "Start: 12.3s")
     status_str = "Most Recent Step, " if is_most_recent else ""
+    clock = time_label or f"Start: {relative_time}"
 
     # In the live window the summary is omitted from the detailed view header
     # as it is already fully detailed below; replay callers opt in because the
     # summary is the Operator's own claim about the step, which an auditor
     # compares against the evidence that follows.
-    step_line = f"- **Step {step['step_number']} ({status_str}Start: {relative_time})**"
+    step_line = f"- **Step {step['step_number']} ({status_str}{clock})**"
     if include_summary:
         screen_line = _screen_description_line(step, summary)
         if screen_line:
@@ -655,9 +812,10 @@ def _render_step_detailed(
     if raw_thinking and raw_thinking.strip() and not thought_exists(raw_thinking):
         operator_events.append({"type": "thought", "content": raw_thinking.strip()})
 
-    # 4. Render Operator Loop
+    # 4. Render the acting model's reasoning and tool calls (role-neutral: the
+    #    same block replays a Flash turn and a Pro Operator turn)
     if operator_events:
-        step_line += "\n  * [Operator Decision Loop]:"
+        step_line += f"\n  * {REASONING_BLOCK_LABEL}:"
         ACTION_TOOLS = {
             "click",
             "swipe",
@@ -682,7 +840,7 @@ def _render_step_detailed(
                 )
                 cleaned = re.sub(r"</?thought>", "", cleaned, flags=re.DOTALL).strip()
                 if cleaned:
-                    step_line += f"\n    - {cleaned}"
+                    step_line += f"\n    - {_indent_continuation(cleaned)}"
             elif e_type == "tool_call":
                 if name in ACTION_TOOLS:
                     continue
@@ -695,17 +853,13 @@ def _render_step_detailed(
                 if formatted:
                     step_line += f"\n    - [Tool Call]: {formatted}"
 
-    # Check if the execution failed
-    exec_error = None
-    if isinstance(result, dict) and result.get("status") in ("failed", "error"):
-        exec_error = failed_execution_error(result)
-
-    # 5. Render Planned Action (single vetted action or fast-action burst)
+    # 5. Render the action the step executed (single vetted action or a burst).
+    #    A failed action's error is printed once, on the [Result] line below.
     if action:
         actions = action if isinstance(action, list) else [action]
         if len(actions) > 1:
             step_line += (
-                f"\n  * [Planned Fast-Action Burst]: {len(actions)} actions fired back to"
+                f"\n  * {BURST_BLOCK_LABEL}: {len(actions)} actions fired back to"
                 " back without the safety net"
             )
             for i, member in enumerate(actions):
@@ -716,15 +870,11 @@ def _render_step_detailed(
             action_clean = format_action_clean(actions[0])
             if intercepted:
                 step_line += (
-                    f"\n  * [Planned Action]: {action_clean}"
+                    f"\n  * {ACTION_BLOCK_LABEL}: {action_clean}"
                     " (Intercepted by Pre-Execution Safety Net)"
                 )
-            elif exec_error:
-                step_line += (
-                    f"\n  * [Planned Action]: {action_clean} -> (Execution failed: {exec_error})"
-                )
             else:
-                step_line += f"\n  * [Planned Action]: {action_clean}"
+                step_line += f"\n  * {ACTION_BLOCK_LABEL}: {action_clean}"
 
     # 6. Render Pre-Execution Safety Net
     if intercepted:
@@ -852,7 +1002,7 @@ def build_plan_and_history(
             # Ensure the last step is always in detailed_step_ids
             detailed_step_ids.add(full_info_step_id)
 
-        # M4: chunk blocks replace the per-step lines of already-chunked
+        # Chunk blocks replace the per-step lines of already-chunked
         # ranges. Chunks only ever cover frozen (old) turns, so they are
         # emitted first, in chronological order; steps that must render
         # detailed (recent window / most-recent step) are never suppressed.
