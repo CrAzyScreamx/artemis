@@ -893,6 +893,21 @@ def get_google_llm(
     return ModelFactory.create_model(ep)
 
 
+def get_llm_for_model(model_name: str, temperature: float | None = None) -> BaseChatModel:
+    """Builds a raw model for bare model-name knobs (step_summarizer.model,
+    memory.chunking.model) so a Claude-only setup does not need a Gemini key."""
+    # ponytail: prefix sniffing; add a `provider` key to those knobs if this ever misroutes.
+    if model_name.lower().startswith("claude"):
+        ep = ModelEndpoint(
+            provider=ModelProvider.ANTHROPIC,
+            model_name=model_name,
+            temperature=temperature or 0.0,
+            timeout_seconds=60.0,
+        )
+        return ModelFactory.create_model(ep)
+    return get_google_llm(model_name=model_name, temperature=temperature)
+
+
 def _resolve_endpoint(
     ctx: ArtemisContext,
     name: str,
