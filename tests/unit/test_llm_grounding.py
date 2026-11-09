@@ -14,20 +14,26 @@
 
 """Unit tests for ModelFactory instantiation and grounding tool wiring."""
 
+from langchain_core.messages import HumanMessage
+
 from artemis.llm.router import ModelEndpoint, ModelFactory, ModelProvider
 
 
 def test_model_factory_anthropic_instantiation():
-    """Verify Anthropic Claude model instantiation with thinking budget."""
+    """Current Claude models: effort via output_config, no temperature/budget_tokens (400s)."""
     anth_ep = ModelEndpoint(
         provider=ModelProvider.ANTHROPIC,
-        model_name="claude-3-7-sonnet-20250219",
+        model_name="claude-sonnet-5-5",
         api_key="sk-ant-test-key",
+        temperature=0.0,
+        thinking_budget=8192,
         reasoning_effort="high",
     )
     model = ModelFactory.create_model(anth_ep)
-    assert model.model == "claude-3-7-sonnet-20250219"
-    assert getattr(model, "thinking", None) == {"type": "enabled", "budget_tokens": 32768}
+    assert model.model == "claude-sonnet-5-5"
+    payload = model._get_request_payload([HumanMessage("hi")])
+    assert payload["output_config"] == {"effort": "high"}
+    assert "temperature" not in payload and "thinking" not in payload
 
 
 def test_model_factory_openai_instantiation():

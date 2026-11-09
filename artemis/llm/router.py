@@ -315,19 +315,19 @@ class ModelFactory:
                 )
                 or os.environ.get("ANTHROPIC_API_KEY")
             )
+            # Current Claude models reject non-default temperature and
+            # budget_tokens (400); they think adaptively by default and take
+            # depth via output_config.effort. ponytail: no pre-4.6 Claude path,
+            # re-add budget_tokens only if an older Claude model is configured.
             kwargs = {
                 "model": endpoint.model_name,
-                "temperature": endpoint.temperature,
                 "api_key": api_key,
                 "timeout": endpoint.timeout_seconds,
+                "max_tokens": 16000,  # langchain default 4096 truncates once thinking counts
             }
-            budget = endpoint.thinking_budget
-            if not budget and endpoint.reasoning_effort:
-                effort_map = {"low": 2048, "medium": 8192, "high": 32768}
-                budget = effort_map.get(endpoint.reasoning_effort.lower())
-            if budget:
-                kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                kwargs["temperature"] = 1.0
+            effort = (endpoint.reasoning_effort or endpoint.thinking_level or "").lower()
+            if effort in {"low", "medium", "high", "xhigh", "max"}:
+                kwargs["output_config"] = {"effort": effort}
             return ChatAnthropic(**{k: v for k, v in kwargs.items() if v is not None})
 
         elif provider == ModelProvider.OPENROUTER:
